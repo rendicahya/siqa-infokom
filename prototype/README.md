@@ -3,7 +3,7 @@
 Prototype HTML audit mutu internal dengan alur sama seperti SIQA (Penilaian Mandiri → Audit Rubrik),
 tetapi butir yang dinilai adalah seluruh **Matriks Penilaian LAM INFOKOM** (S1/S2/S3) per tahap PPEPP.
 
-Buka `index.html` langsung di browser. Tidak perlu server atau build.
+Buka `index.html` di root repo langsung di browser (tidak perlu server atau build), atau versi daring di https://rendicahya.github.io/siqa-infokom/. `prototype/index.html` hanya mengalihkan ke root.
 
 ## Halaman
 
