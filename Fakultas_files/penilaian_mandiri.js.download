@@ -1,0 +1,2438 @@
+/**
+ * JavaScript Controller: Rubrik Penilaian Mandiri (3 Kolom)
+ * Fitur:
+ * - Penyimpanan Asinkron (AJAX) per butir / per opsi tanpa harus isi semua sekaligus
+ * - Real-time Progress Bar & Indikator Wajib Unit
+ * - Penanda Visual Jelas untuk butir yang Belum/Perlu Diisi vs Sudah Diisi
+ * - Upload & Manajemen Bukti Dukung (Berkas Fisik & Tautan URL Eksternal)
+ * - Navigasi Kriteria & Filter Butir
+ */
+
+(function ($) {
+    'use strict';
+
+    var idpenugasan = $('#rubrik-penilaian-root').data('idpenugasan');
+    var rawJawabanList = [];
+    var kriteriaList = [];
+    var currentFilterKriteria = '';
+    var currentFilterStatus = 'all'; // all, belum, sudah, wajib
+    var currentSearch = '';
+    var saveDebounceTimers = {};
+    var isLocked = false;
+    var isFinishedAuditor = false;
+    var isProgrammaticScroll = false;
+    var scrollSpyTimer = null;
+    var currentActiveIndikatorId = null;
+
+    /**
+     * Helper htmlspecialchars & nl2br
+     */
+    function htmlspecialchars(str) {
+        if (!str) return '';
+        return $('<div>').text(str).html();
+    }
+
+    function nl2br(str) {
+        if (!str) return '';
+        return str.replace(/(?:\r\n|\r|\n)/g, '<br>');
+    }
+
+    $(document).ready(function () {
+        if (typeof $.Loading !== 'undefined' && $.Loading.defaults) {
+            $.Loading.defaults.zIndex = 105000;
+        }
+
+        if (!idpenugasan) {
+            console.error("ID Penugasan tidak ditemukan!");
+            return;
+        }
+
+        isLocked = ($('#rubrik-penilaian-root').data('is-locked') == '1');
+        isFinishedAuditor = ($('#rubrik-penilaian-root').data('is-finished-auditor') == '1');
+
+        initStickySidebar();
+        initEvents();
+        loadRubrikData();
+    });
+
+    /**
+     * Inisialisasi & penyesuaian posisi sticky sidebar
+     */
+    function initStickySidebar() {
+        // Hilangkan batasan overflow pada wrapper AdminLTE jika ada
+        $('.wrapper, .content-wrapper, .content, #rubrik-penilaian-root').css({
+            'overflow': 'visible'
+        });
+    }
+
+    /**
+     * Inisialisasi event listener UI
+     */
+    function initEvents() {
+        // Filter Status Isian Dropdown (Perlu diisi vs Sudah diisi)
+        $('#filter-status-isian').on('change', function () {
+            currentFilterStatus = $(this).val();
+            renderRubrikItems();
+        });
+
+        // Search Input Konten Tengah
+        $('#input-search-rubrik').on('keyup', function () {
+            currentSearch = $(this).val().toLowerCase().trim();
+            renderRubrikItems();
+        });
+
+        // Searchbox Sidebar Navigasi Indikator
+        $('#search-sidebar-indikator').on('input keyup', function () {
+            filterSidebarIndikator();
+        });
+        $('#search-sidebar-indikator').on('keydown', function (e) {
+            if (e.keyCode === 27) {
+                $(this).val('').trigger('input');
+            }
+        });
+        $('#btn-clear-sidebar-search').on('click', function () {
+            $('#search-sidebar-indikator').val('').trigger('input').focus();
+        });
+
+        // Radio pilihan tipe bukti modal
+        $('input[name="tipe_bukti_pilihan"]').on('change', function () {
+            if ($(this).val() === 'file') {
+                $('#group-input-file').show();
+                $('#group-input-url').hide();
+            } else {
+                $('#group-input-file').hide();
+                $('#group-input-url').removeClass('display-none hidden').show();
+            }
+        });
+
+        // Submit Form Upload Bukti Dukung
+        $('#btn-submit-bukti').on('click', function () {
+            submitUploadBukti();
+        });
+
+        // Tombol pemicu automasi nilai rumus
+        $(document).on('click', '.btn-trigger-automasi-rumus', function () {
+            openAutomasiModal();
+        });
+
+        // Tombol Submit & Kunci Penilaian Mandiri
+        $(document).on('click', '.btn-submit-kunci-auditee', function () {
+            submitKunciAuditee();
+        });
+
+        // Pilih / batalkan semua checkbox automasi
+        $('#btn-auto-select-all').on('click', function () {
+            $('.chk-auto-item').prop('checked', true);
+            updateSelectedAutoCount();
+        });
+
+        $('#btn-auto-deselect-all').on('click', function () {
+            $('.chk-auto-item').prop('checked', false);
+            updateSelectedAutoCount();
+        });
+
+        $('#chk-auto-all').on('change', function () {
+            $('.chk-auto-item').prop('checked', $(this).is(':checked'));
+            updateSelectedAutoCount();
+        });
+
+        // Tombol eksekusi terapkan automasi
+        $('#btn-apply-automasi-terpilih').on('click', function () {
+            applyAutomasiNilai();
+        });
+
+        // Tombol kalkulasi ulang butir ke nilai perhitungan rumus/variabel
+        $(document).on('click', '.btn-recalc-single', function () {
+            var idjawaban = $(this).data('id');
+            recalculateSingleItem(idjawaban);
+        });
+
+        // Tombol refresh nilai variabel pada sub-aspek
+        $(document).on('click', '.btn-refresh-variabel-sub', function () {
+            var idjawaban = $(this).data('id');
+            refreshSubAspekVariabel(idjawaban);
+        });
+
+        // Window scroll & resize event untuk sinkronisasi scroll item sidebar indikator (ScrollSpy)
+        $(window).off('scroll.sidebarScrollSpy resize.sidebarScrollSpy');
+        $(window).on('scroll.sidebarScrollSpy', function () {
+            if (isProgrammaticScroll) return;
+            if (scrollSpyTimer) return;
+            scrollSpyTimer = requestAnimationFrame(function () {
+                scrollSpyTimer = null;
+                syncSidebarOnScroll();
+            });
+        });
+        $(window).on('resize.sidebarScrollSpy', function () {
+            if (isProgrammaticScroll) return;
+            syncSidebarOnScroll();
+        });
+    }
+
+    /**
+     * Konfirmasi dan Kunci Penilaian Mandiri Auditee
+     */
+    function submitKunciAuditee() {
+        var unfulfilledMandatory = [];
+        $.each(rawJawabanList, function (_, itm) {
+            if (parseInt(itm.is_mandatory) === 1 && parseInt(itm.is_terisi) !== 1) {
+                unfulfilledMandatory.push(itm.kode_sub_aspek || ('Butir ' + itm.id_sub_aspek));
+            }
+        });
+
+        var warningMsg = 'Setelah disubmit, isian penilaian mandiri akan dikunci (read-only) dan diteruskan ke Tim Auditor untuk proses audit pemenuhan standar.';
+        if (unfulfilledMandatory.length > 0) {
+            warningMsg += '\n\nPerhatian: Masih terdapat ' + unfulfilledMandatory.length + ' butir wajib yang belum terisi (' + unfulfilledMandatory.slice(0, 5).join(', ') + (unfulfilledMandatory.length > 5 ? '...' : '') + ').';
+        }
+
+        swal({
+            title: 'Submit & Kunci Penilaian Mandiri?',
+            text: warningMsg,
+            icon: 'warning',
+            buttons: {
+                cancel: {
+                    text: 'Batal',
+                    visible: true,
+                    className: 'btn btn-default'
+                },
+                confirm: {
+                    text: 'Ya, Submit & Kunci!',
+                    value: true,
+                    className: 'btn btn-success'
+                }
+            }
+        }).then(function (confirmed) {
+            if (confirmed) {
+                $('body').loading('start');
+                $.ajax({
+                    url: appBaseUrl + '/penugasan/rubrik_submit_auditee',
+                    type: 'POST',
+                    data: { idpenugasan: idpenugasan },
+                    dataType: 'json'
+                }).done(function (res) {
+                    $('body').loading('stop');
+                    if (res && res.status) {
+                        swal({
+                            title: 'Berhasil!',
+                            text: 'Penilaian mandiri telah berhasil disubmit dan dikunci.',
+                            icon: 'success'
+                        }).then(function () {
+                            location.reload();
+                        });
+                    } else {
+                        swal('Gagal', (res && res.message) ? res.message : 'Tidak dapat mengunci penilaian mandiri.', 'error');
+                    }
+                }).fail(function () {
+                    $('body').loading('stop');
+                    swal('Error', 'Terjadi kesalahan jaringan saat submit.', 'error');
+                });
+            }
+        });
+    }
+
+    /**
+     * Memuat data jawaban rubrik dan struktur instrumen dari server
+     */
+    function loadRubrikData() {
+        $('body').loading('start');
+        var url = appBaseUrl + '/penugasan/rubrik_find_jawaban';
+
+        $.ajax({
+            url: url,
+            type: 'POST',
+            data: { idpenugasan: idpenugasan },
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status && res.data) {
+                rawJawabanList = res.data;
+                extractKriteriaList();
+                renderKriteriaPills();
+                renderRubrikItems();
+                updateProgressBar();
+            } else {
+                $('#rubrik-items-container').html(
+                    '<div class="alert alert-warning text-center">' +
+                    '<i class="fa fa-exclamation-triangle"></i> ' +
+                    (res && res.message ? res.message : 'Belum ada butir rubrik aktif yang sesuai dengan profil unit kerja ini.') +
+                    '</div>'
+                );
+            }
+        }).fail(function (xhr, status, err) {
+            console.error(err);
+            swal('Error', 'Gagal memuat instrumen rubrik penilaian.', 'error');
+        }).always(function () {
+            $('body').loading('stop');
+        });
+    }
+
+    /**
+     * Ekstrak daftar unik kriteria dari data jawaban
+     */
+    function extractKriteriaList() {
+        var map = {};
+        kriteriaList = [];
+
+        $.each(rawJawabanList, function (i, item) {
+            if (item.id_kriteria && !map[item.id_kriteria]) {
+                map[item.id_kriteria] = true;
+                kriteriaList.push({
+                    id_kriteria: item.id_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    nama_kriteria: item.nama_kriteria,
+                    urutan: item.kriteria_urutan || i
+                });
+            }
+        });
+
+        kriteriaList.sort(function (a, b) {
+            return (a.urutan || 0) - (b.urutan || 0);
+        });
+    }
+
+    /**
+     * Render Tombol Filter Kriteria di Toolbar
+     */
+    function renderKriteriaPills() {
+        var html = '<button type="button" class="btn btn-primary btn-sm filter-pill-btn ' + (currentFilterKriteria === '' ? 'active' : '') + '" data-idkriteria="">Semua Kriteria</button>';
+
+        $.each(kriteriaList, function (i, k) {
+            var isActive = (currentFilterKriteria == k.id_kriteria) ? 'active btn-primary' : 'btn-default';
+            html += '<button type="button" class="btn btn-sm filter-pill-btn ' + isActive + '" data-idkriteria="' + k.id_kriteria + '">' +
+                htmlspecialchars(k.nama_kriteria || k.kode_kriteria) +
+                '</button>';
+        });
+
+        $('#filter-kriteria-pills').html(html);
+
+        // Bind click event
+        $('#filter-kriteria-pills .filter-pill-btn').on('click', function () {
+            $('#filter-kriteria-pills .filter-pill-btn').removeClass('active btn-primary').addClass('btn-default');
+            $(this).addClass('active btn-primary').removeClass('btn-default');
+            currentFilterKriteria = $(this).data('idkriteria');
+            renderRubrikItems();
+        });
+    }
+
+    /**
+     * Render Seluruh Butir Rubrik (Kolom Tengah & Kolom Kanan) serta Kolom Kiri
+     * Setiap m_rubrik_aspek menjadi 1 Card terpadu, dan seluruh sub-aspek di dalamnya berada dalam card tersebut.
+     */
+    /**
+     * Status ringkas dalam bentuk teks (bukan lencana warna-warni)
+     */
+    function aspekStatusHtml(terisi, total, hasUnfilledWajib) {
+        if (total > 0 && terisi >= total) {
+            return '<span class="status-text status-ok"><i class="fa fa-check-circle"></i> Lengkap (' + terisi + ' dari ' + total + ')</span>';
+        }
+        if (hasUnfilledWajib) {
+            return '<span class="status-text status-warn"><i class="fa fa-exclamation-circle"></i> Perlu dilengkapi (' + terisi + ' dari ' + total + ')</span>';
+        }
+        return '<span class="status-text status-muted">' + terisi + ' dari ' + total + ' terisi</span>';
+    }
+
+    function subStatusHtml(id, terisi, wajib) {
+        if (terisi) {
+            return '<span class="status-text status-ok" id="sub-status-badge-' + id + '"><i class="fa fa-check-circle"></i> Terisi</span>';
+        }
+        if (wajib) {
+            return '<span class="status-text status-warn" id="sub-status-badge-' + id + '"><i class="fa fa-exclamation-circle"></i> Wajib diisi</span>';
+        }
+        return '<span class="status-text status-muted" id="sub-status-badge-' + id + '">Belum diisi</span>';
+    }
+
+    function renderRubrikItems() {
+        var filteredItems = filterItems();
+
+        // Render Kolom Kiri: Indikator Context
+        renderKolomKiri(filteredItems);
+
+        // Render Kolom Tengah & Kanan: Aspek, Sub-aspek & Form Isian
+        if (!filteredItems || filteredItems.length === 0) {
+            $('#rubrik-items-container').html(
+                '<div class="well bg-white text-center pad-40">' +
+                '<i class="fa fa-info-circle text-muted margin"></i>' +
+                '<span class="text-slate-500 text-semibold margin-top-10">Tidak ada butir rubrik yang cocok dengan filter yang dipilih.</span>' +
+                '</div>'
+            );
+            return;
+        }
+
+        // Kelompokkan filteredItems berdasarkan id_aspek (1 Card per m_rubrik_aspek)
+        var groupedAspek = [];
+        var aspekMap = {};
+
+        $.each(filteredItems, function (idx, item) {
+            var aId = item.id_aspek;
+            if (!aspekMap[aId]) {
+                aspekMap[aId] = {
+                    id_aspek: aId,
+                    kode_aspek: item.kode_aspek,
+                    label_aspek: item.label_aspek,
+                    deskripsi_aspek: item.deskripsi_aspek,
+                    sumber_data: item.sumber_data,
+                    deskripsi_pemenuhan: item.deskripsi_pemenuhan,
+                    id_indikator: item.id_indikator,
+                    nomor_indikator: item.nomor_indikator,
+                    pernyataan_indikator: item.pernyataan_indikator,
+                    justifikasi: item.justifikasi,
+                    id_kriteria: item.id_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    nama_kriteria: item.nama_kriteria,
+                    id_sasaran_mutu: item.id_sasaran_mutu,
+                    kode_sasaran: item.kode_sasaran,
+                    nama_sasaran: item.nama_sasaran,
+                    is_syarat_unggul_aspek: item.is_syarat_unggul_aspek,
+                    is_syarat_unggul_indikator: item.is_syarat_unggul_indikator,
+                    sub_items: []
+                };
+                groupedAspek.push(aspekMap[aId]);
+            }
+            aspekMap[aId].sub_items.push(item);
+        });
+
+        var html = '';
+        var lastIndikatorId = null;
+
+        $.each(groupedAspek, function (aIdx, aspek) {
+            // Tampilkan Header Pembatas Indikator Baru saat berpindah indikator
+            if (aspek.id_indikator !== lastIndikatorId) {
+                lastIndikatorId = aspek.id_indikator;
+                html += renderIndikatorSectionHeader(aspek, aIdx);
+            }
+
+            // Hitung status kelengkapan aspek dari rawJawabanList
+            var totalSubInAspek = 0;
+            var terisiSubInAspek = 0;
+            var hasUnfilledWajibInAspek = false;
+            var isAspekWajib = false;
+            var isSyaratUnggul = (parseInt(aspek.is_syarat_unggul_aspek) === 1 || parseInt(aspek.is_syarat_unggul_indikator) === 1);
+
+            $.each(rawJawabanList, function (rIdx, rItem) {
+                if (rItem.id_aspek == aspek.id_aspek) {
+                    totalSubInAspek++;
+                    var rTerisi = (parseInt(rItem.is_terisi) === 1);
+                    var rWajib = (parseInt(rItem.is_mandatory) === 1);
+                    if (rWajib) isAspekWajib = true;
+
+                    if (rTerisi) {
+                        terisiSubInAspek++;
+                    } else if (rWajib) {
+                        hasUnfilledWajibInAspek = true;
+                    }
+                }
+            });
+
+            var isAllTerisi = (totalSubInAspek > 0 && terisiSubInAspek >= totalSubInAspek);
+            var statusBoxClass = isAllTerisi ? 'status-sudah-diisi' : 'status-belum-diisi';
+            if (hasUnfilledWajibInAspek) {
+                statusBoxClass += ' wajib-item';
+            }
+
+            var headerStatusBadge = aspekStatusHtml(terisiSubInAspek, totalSubInAspek, hasUnfilledWajibInAspek);
+
+            // Ambil judul aspek ringkas untuk sticky header
+            var aspekTitle = aspek.label_aspek;
+            if (!aspekTitle && aspek.deskripsi_aspek) {
+                var firstLine = aspek.deskripsi_aspek.split(/\r?\n/)[0].trim();
+                aspekTitle = firstLine;
+            }
+
+            // 1 CARD PER ASPEK
+            html += '<div class="rubrik-item-box aspek-card ' + statusBoxClass + '" id="aspek-card-' + aspek.id_aspek + '" data-idaspek="' + aspek.id_aspek + '" data-idindikator="' + aspek.id_indikator + '">';
+
+            // STICKY HEADER ASPEK (Menampilkan Kode, Judul Aspek, Badges, dan Status)
+            html += '<div class="rubrik-item-header">' +
+                '<div class="aspek-header-flex">' +
+                '<span class="aspek-badge bg-blue font-bold aspek-badge-title">' + htmlspecialchars(aspek.kode_aspek) + '</span> ' +
+                (isSyaratUnggul ? '<span class="status-text status-muted margin-l-5" title="Syarat Perlu">Syarat perlu</span> ' : '') +
+                '</div>' +
+                '<div class="aspek-header-status flex-shrink-0" id="aspek-status-header-' + aspek.id_aspek + '">' +
+                headerStatusBadge +
+                '</div>' +
+                '</div>';
+
+            // OVERVIEW PANEL ASPEK (Deskripsi Aspek, Sumber Data, Deskripsi Pemenuhan)
+            html += '<div class="aspek-overview-panel">' +
+                '<div class="aspek-overview-text">' +
+                nl2br(htmlspecialchars(aspek.deskripsi_aspek)) +
+                '</div>';
+
+            // Sumber data & kriteria pemenuhan: tersedia, tetapi dilipat agar halaman tidak padat
+            if (aspek.sumber_data || aspek.deskripsi_pemenuhan) {
+                html += '<details class="rincian-toggle"><summary>Sumber data dan kriteria pemenuhan</summary><div class="rincian-body">';
+                if (aspek.sumber_data) {
+                    html += '<div class="meta-row"><b>Sumber data:</b> ' + htmlspecialchars(aspek.sumber_data) + '</div>';
+                }
+                if (aspek.deskripsi_pemenuhan) {
+                    html += '<div class="meta-row"><b>Kriteria pemenuhan:</b> ' + htmlspecialchars(aspek.deskripsi_pemenuhan) + '</div>';
+                }
+                html += '</div></details>';
+            }
+
+            html += '</div>'; // End aspek-overview-panel
+
+            // CONTAINER SUB-ASPEK DALAM ASPEK CARD
+            html += '<div class="sub-aspek-container">';
+
+            $.each(aspek.sub_items, function (sIdx, sub) {
+                var isSubWajib = (parseInt(sub.is_mandatory) === 1);
+                var isSubTerisi = (parseInt(sub.is_terisi) === 1);
+
+                var subStatusRowClass = isSubTerisi ? 'sub-terisi' : (isSubWajib ? 'sub-wajib-belum' : 'sub-belum-diisi');
+
+                var subStatusBadge = subStatusHtml(sub.id_penugasan_jawaban, isSubTerisi, isSubWajib);
+
+                html += '<div class="sub-aspek-row ' + subStatusRowClass + '" id="box-item-' + sub.id_penugasan_jawaban + '" data-idjawaban="' + sub.id_penugasan_jawaban + '">';
+
+                // Header bar per sub-aspek
+                var noButir = sub.sub_nomor_urut || (sIdx + 1);
+                html += '<div class="sub-aspek-row-header">' +
+                    '<div>' +
+                    '<span class="aspek-badge font-bold aspek-badge-sub">Butir ' + noButir + '</span> ' +
+                    (isSubWajib ? '<span class="status-text status-muted margin-l-5">Wajib</span>' : '') +
+                    '</div>' +
+                    '<div id="sub-status-container-' + sub.id_penugasan_jawaban + '">' +
+                    subStatusBadge +
+                    '</div>' +
+                    '</div>';
+
+                // ROW 2 KOLOM SUB-ASPEK
+                html += '<div class="row row-flex-wrap">';
+
+                // Kolom Kiri Sub (Tengah Layar): Pernyataan Sub-Aspek, Target, Panduan
+                html += '<div class="col-sm-6 aspek-content-panel">';
+
+                html += '<div class="sub-pernyataan-box">' +
+                    '<div class="fs-13 text-navy text-semibold line-height-150">' +
+                    nl2br(htmlspecialchars(sub.pernyataan_sub_aspek)) +
+                    '</div>';
+
+                // Target ditulis sebagai kalimat; rumus & data pendukung dilipat
+                if (sub.operator_pembanding && sub.nilai_target_min) {
+                    html += '<div class="margin-top-8 text-slate-600"><b>Target:</b> ' +
+                        htmlspecialchars(sub.operator_pembanding) + ' ' + parseFloat(sub.nilai_target_min) + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') +
+                        '</div>';
+                }
+
+                var punyaRincian = !!(sub.rumus_kalkulasi || (sub.variabel_list && sub.variabel_list.length) || sub.panduan_pengisian);
+                if (punyaRincian) {
+                    html += '<details class="rincian-toggle"><summary>Panduan, rumus, dan data pendukung</summary><div class="rincian-body">';
+
+                    if (sub.panduan_pengisian) {
+                        html += '<div class="meta-row"><b>Panduan pengisian:</b> ' + htmlspecialchars(sub.panduan_pengisian) + '</div>';
+                    }
+                    if (sub.rumus_kalkulasi) {
+                        html += '<div class="meta-row"><b>Rumus:</b> <code>' + htmlspecialchars(sub.rumus_kalkulasi) + '</code></div>';
+                    }
+
+                    // Butir berumus tanpa variabel terlampir: sediakan tombol hitung ulang
+                    if (sub.rumus_kalkulasi && (!sub.variabel_list || sub.variabel_list.length === 0)) {
+                        html += '<div class="sub-aspek-recalc-action">' +
+                            '<button type="button" class="btn btn-xs btn-primary btn-refresh-variabel-sub" data-id="' + sub.id_penugasan_jawaban + '" title="Ambil ulang data dan hitung kembali butir ini">' +
+                            '<i class="fa fa-refresh"></i> Hitung ulang' +
+                            '</button>' +
+                            '</div>';
+                    }
+
+                    html += renderSubAspekVariabelBox(sub);
+                    html += '</div></details>';
+                } else {
+                    html += renderSubAspekVariabelBox(sub);
+                }
+
+                html += '</div>'; // End box pernyataan
+                html += '</div>'; // End Kolom Kiri Sub
+
+                // Kolom Kanan Sub (Kanan Layar): Form Isian Jawaban Unit & Bukti Dukung
+                html += '<div class="col-sm-6 jawaban-content-panel">';
+                html += renderFormJawaban(sub);
+                html += '</div>'; // End Kolom Kanan Sub
+
+                html += '</div>'; // End row flex
+                html += '</div>'; // End sub-aspek-row
+            });
+
+            html += '</div>'; // End sub-aspek-container
+            html += '</div>'; // End rubrik-item-box (aspek-card)
+        });
+
+        $('#rubrik-items-container').html(html);
+
+        // Bind AJAX Auto-Save dan Action Handlers
+        bindFormHandlers();
+    }
+
+    /**
+     * Render Banner Header Pembatas Antar Indikator di List Card Halaman Penilaian
+     */
+    function renderIndikatorSectionHeader(aspek, aIdx) {
+        var isSyaratUnggul = (parseInt(aspek.is_syarat_unggul_indikator) === 1);
+        var marginClass = (aIdx > 0) ? 'margin-top-35' : 'margin-top-5';
+
+        var h = '<div class="indikator-section-header indikator-header-box ' + marginClass + '" id="indikator-section-' + aspek.id_indikator + '" data-idindikator="' + aspek.id_indikator + '">';
+        h += '<div>';
+
+        // Baris Atas: Tag Kriteria, Sasaran Mutu (PPEPP), Syarat Unggul, dan Badge Nomor Indikator
+        h += '<div class="indikator-header-top">';
+        h += '<div class="indikator-badge-group">';
+        h += '<span class="label label-primary fs-11 pad-3-8 text-bold">';
+        h += '<i class="fa fa-folder-open"></i> ' + htmlspecialchars(aspek.nama_kriteria || aspek.kode_kriteria);
+        h += '</span>';
+
+        if (aspek.nama_sasaran) {
+            h += '<span class="label label-default fs-11 border-dashed-white-25 pad-3-8">';
+            h += '<i class="fa fa-crosshairs"></i> ' + htmlspecialchars(aspek.nama_sasaran);
+            h += '</span>';
+        }
+
+        if (isSyaratUnggul) {
+            h += '<span class="label label-warning fs-11 pad-3-8 text-bold" title="Syarat Perlu">';
+            h += '<i class="fa fa-check-circle"></i> Syarat Perlu';
+            h += '</span>';
+        }
+        h += '</div>';
+
+        h += '</div>';
+
+        // Baris Bawah: Pernyataan Standar Indikator SPMI
+        h += '<div class="indikator-title-text">';
+        h += '<span class="margin-r-5">Indikator ' + htmlspecialchars(aspek.nomor_indikator) + ':</span> ';
+        h += nl2br(htmlspecialchars(aspek.pernyataan_indikator));
+        h += '</div>';
+
+        // Justifikasi / Regulasi jika ada
+        if (aspek.justifikasi) {
+            h += '<div class="indikator-desc-text">';
+            h += '<i class="fa fa-bookmark text-primary"></i> <b>Rujukan / Regulasi:</b> ' + htmlspecialchars(aspek.justifikasi);
+            h += '</div>';
+        }
+
+        h += '</div>';
+        h += '</div>';
+
+        return h;
+    }
+
+    /**
+     * Render Komponen Form Jawaban pada Kolom Kanan
+     */
+    function renderFormJawaban(item) {
+        var id = item.id_penugasan_jawaban;
+        var html = '<form id="form-jawaban-' + id + '" data-id="' + id + '" onsubmit="return false;">';
+        html += '<input type="hidden" name="id_penugasan_jawaban" value="' + id + '">';
+        html += '<input type="hidden" name="idpenugasan" value="' + idpenugasan + '">';
+
+        html += '<div class="jawaban-form-group">';
+        html += '<div class="clearfix margin-bottom-5">' +
+            '<label class="no-margin">Jawaban unit</label>' +
+            '<span class="save-status-indicator text-muted pull-right" id="save-status-' + id + '">' +
+            (isLocked ? '<i class="fa fa-lock text-muted"></i> Hanya dibaca' : (item.is_terisi ? '<i class="fa fa-check-circle text-success"></i> Tersimpan' : 'Belum diisi')) +
+            '</span>' +
+            '</div>';
+
+        // 1. INPUT BERDASARKAN 3 TIPE JAWABAN & BUKTI DUKUNG
+        var calcInfo = evaluateSubItemFormula(item);
+        var effectiveValKuan = (item.nilai_kuantitatif !== null && item.nilai_kuantitatif !== undefined && item.nilai_kuantitatif !== '')
+            ? item.nilai_kuantitatif
+            : ((calcInfo && calcInfo.result !== null && !calcInfo.hasMissing) ? calcInfo.result : '');
+        var valKuantitatif = (effectiveValKuan !== '') ? effectiveValKuan : '';
+        var tipe = item.tipe_jawaban || 'sumber_data';
+        var isHitungRumus = (tipe === 'sumber_data') || (item.rumus_kalkulasi && item.rumus_kalkulasi.trim() !== '');
+
+        // BUKTI DUKUNG SECTION (DILETAKKAN DI ATAS INPUTAN ANGKA)
+        // Disembunyikan jika nilai butir berasal dari proses hitung rumus/sumber data otomatis
+        if (!isHitungRumus) {
+            var buktiCount = item.bukti_dukung ? item.bukti_dukung.length : 0;
+            var isWajibBukti = (parseInt(item.wajib_bukti_dukung) === 1 || tipe === 'dokumen');
+
+            html += '<div class="bukti-upload-container margin-bottom-12">' +
+                '<div class="clearfix margin-bottom-5">' +
+                '<span class="pull-left" style="font-weight:600;">' +
+                '<i class="fa fa-paperclip"></i> Bukti dukung (' + buktiCount + ')' +
+                (isWajibBukti ? ' <span class="status-text status-warn">(wajib)</span>' : '') +
+                '</span>';
+
+            if (!isLocked) {
+                html += '<button type="button" class="btn btn-xs btn-default pull-right btn-modal-bukti" data-id="' + id + '" data-subkode="' + htmlspecialchars(item.kode_sub_aspek) + '">' +
+                    '<i class="fa fa-plus"></i> Tambah' +
+                    '</button>';
+            }
+
+            html += '</div>';
+
+            html += '<div class="bukti-list" id="bukti-list-' + id + '">';
+            if (item.bukti_dukung && item.bukti_dukung.length > 0) {
+                $.each(item.bukti_dukung, function (bi, bukti) {
+                    var fileUrl = bukti.tipe_bukti === 'url'
+                        ? (bukti.url_eksternal || '#')
+                        : (bukti.file_url || (bukti.file_path ? (appBaseUrl + '/' + bukti.file_path) : '#'));
+                    var ext = (bukti.file_ext || '').toLowerCase();
+                    var icon = (bukti.tipe_bukti === 'url') ? 'fa-external-link text-primary' : 'fa-file-text-o text-danger';
+                    if (ext === 'pdf') icon = 'fa-file-pdf-o text-danger';
+                    else if (ext === 'doc' || ext === 'docx') icon = 'fa-file-word-o text-primary';
+                    else if (ext === 'xls' || ext === 'xlsx') icon = 'fa-file-excel-o text-success';
+                    else if (ext === 'zip' || ext === 'rar') icon = 'fa-file-archive-o text-warning';
+                    else if (['jpg', 'jpeg', 'png', 'gif'].indexOf(ext) >= 0) icon = 'fa-file-image-o text-info';
+
+                    html += '<div class="bukti-item" id="bukti-item-' + bukti.id_bukti + '">' +
+                        '<span><i class="fa ' + icon + '"></i> <a href="' + fileUrl + '" target="_blank" title="' + htmlspecialchars(bukti.nama_dokumen) + '">' + htmlspecialchars(bukti.nama_dokumen) + '</a></span>';
+                    if (!isLocked) {
+                        html += '<button type="button" class="btn btn-xs btn-link text-danger btn-delete-bukti" data-idbukti="' + bukti.id_bukti + '" data-idjawaban="' + id + '" title="Hapus Bukti">' +
+                            '<i class="fa fa-trash"></i>' +
+                            '</button>';
+                    }
+                    html += '</div>';
+                });
+            } else {
+                html += '<small class="text-muted">Belum ada bukti dukung.</small>';
+            }
+            html += '</div>'; // End bukti-list
+            html += '</div>'; // End bukti-upload-container
+        }
+
+        // INPUT NILAI / CAPAIAN (DIBAWAH BUKTI DUKUNG)
+        if (tipe === 'sumber_data') {
+            html += '<div class="form-group margin-bottom-10">' +
+                '<label class="margin-bottom-5">Nilai (dihitung otomatis)</label>' +
+                '<div class="input-group">' +
+                '<span class="input-group-addon bg-slate-100 font-bold"><i class="fa fa-database text-info"></i></span>' +
+                '<input type="text" name="nilai_kuantitatif" id="input-nilai-otomatis-' + id + '" class="form-control input-sm font-monospace text-bold text-navy bg-slate-100 input-kuantitatif input-nilai-otomatis" value="' + (valKuantitatif !== '' ? parseFloat(valKuantitatif) : '0') + '" readonly>' +
+                (item.satuan ? '<span class="input-group-addon font-bold">' + htmlspecialchars(item.satuan) + '</span>' : '') +
+                '</div>';
+
+            if (item.operator_pembanding && item.nilai_target_min) {
+                var targetStatus = checkTargetFulfilled(valKuantitatif, item.operator_pembanding, item.nilai_target_min, item.nilai_target_max);
+                html += '<div class="target-check-badge margin-top-5" id="target-check-' + id + '">' + targetStatus + '</div>';
+            }
+            // Tombol Hitung Ulang redundant di sini disembunyikan; tombol utama tersedia di bagian aksi variabel/rumus
+            html += '</div>';
+
+        } else if (tipe === 'dokumen') {
+            html += '<div class="alert alert-info padding-8 fs-11 margin-bottom-10">' +
+                '<i class="fa fa-file-text-o"></i> Butir ini dijawab dengan dokumen. Unggah berkas atau cantumkan tautan pada bagian bukti dukung di atas.' +
+                '</div>';
+
+        } else if (tipe === 'data_manual') {
+            html += '<div class="form-group margin-bottom-10">' +
+                '<label class="margin-bottom-5">Capaian unit (isi angka)</label>' +
+                '<div class="input-group">' +
+                '<input type="number" step="any" name="nilai_kuantitatif" class="form-control input-sm input-kuantitatif" placeholder="Ketik angka capaian" value="' + valKuantitatif + '" ' + (isLocked ? 'readonly disabled' : '') + '>' +
+                (item.satuan ? '<span class="input-group-addon font-bold">' + htmlspecialchars(item.satuan) + '</span>' : '<span class="input-group-addon font-bold">Nilai</span>') +
+                '</div>';
+
+            if (item.operator_pembanding && item.nilai_target_min) {
+                var targetStatus = checkTargetFulfilled(valKuantitatif, item.operator_pembanding, item.nilai_target_min, item.nilai_target_max);
+                html += '<div class="target-check-badge margin-top-5" id="target-check-' + id + '">' + targetStatus + '</div>';
+            }
+            html += '</div>';
+        }
+
+        html += '</div>'; // End isian jawaban
+
+        // 2. DESKRIPSI (GANTI TEXT DARI CATATAN / ARGUMEN PEMENUHAN UNIT)
+        var valCatatan = item.catatan_unit ? htmlspecialchars(item.catatan_unit) : '';
+        html += '<div class="jawaban-form-group">' +
+            '<label class="margin-bottom-5">Keterangan</label>' +
+            '<textarea name="catatan_unit" class="form-control input-sm" rows="2" placeholder="Jelaskan bagaimana unit memenuhi butir ini" ' + (isLocked ? 'readonly disabled' : '') + '>' + valCatatan + '</textarea>' +
+            '</div>';
+
+        // 3. ACTION BUTTON
+        if (!isLocked) {
+            html += '<div class="text-right">' +
+                '<button type="button" class="btn btn-primary btn-sm btn-save-jawaban" data-id="' + id + '">' +
+                '<i class="fa fa-save"></i> Simpan' +
+                '</button>' +
+                '</div>';
+        }
+
+        // 4. REVIEWER FEEDBACK (Hanya muncul jika sudah difinalisasi oleh asesor/auditor)
+        if (isFinishedAuditor && (item.status_pemenuhan || (item.status_review && item.status_review !== 'belum_direview'))) {
+            var isMemenuhi = (item.status_pemenuhan === 'Memenuhi');
+            var pemenuhanLabelClass = isMemenuhi ? 'label-success' : 'label-danger';
+            var pemenuhanIcon = isMemenuhi ? 'fa-check-circle' : 'fa-times-circle';
+
+            html += '<div class="sub-review-history-box margin-top-12" style="background:#fff; border:1px solid #e5e7eb; border-left:4px solid ' + (isMemenuhi ? '#047857' : '#b91c1c') + '; padding:12px 14px; border-radius:6px; font-size:15px;">' +
+                '<div><b>Penilaian auditor:</b> ' +
+                (item.status_pemenuhan ? '<span class="status-text ' + (isMemenuhi ? 'status-ok' : 'status-bad') + '"><i class="fa ' + pemenuhanIcon + '"></i> ' + htmlspecialchars(item.status_pemenuhan) + '</span>' : '') +
+                '</div>' +
+                (item.catatan_review ? '<div class="margin-top-8"><b>Catatan:</b> ' + nl2br(htmlspecialchars(item.catatan_review)) + '</div>' : '') +
+                '</div>';
+        }
+
+        html += '</form>';
+        return html;
+    }
+
+    /**
+     * Scroll container #side-indikator-list agar card yang aktif terlihat di area pandang
+     */
+    function scrollSidebarToCard(card, animate) {
+        if (!card || !card.length || !card.is(':visible')) return;
+        var container = $('#side-indikator-list');
+        if (!container.length) return;
+
+        var containerHeight = container.innerHeight();
+        var cardHeight = card.outerHeight();
+        var relativeTop = card.offset().top - container.offset().top;
+
+        // Cek apakah card sudah berada di area pandang container (toleransi 10px dari atas & bawah)
+        var isComfortablyVisible = (relativeTop >= 10 && (relativeTop + cardHeight) <= (containerHeight - 10));
+        if (isComfortablyVisible) return;
+
+        // Hitung scroll target agar card berada di tengah container
+        var currentScroll = container.scrollTop();
+        var targetScroll = currentScroll + relativeTop - (containerHeight / 2) + (cardHeight / 2);
+        if (targetScroll < 0) targetScroll = 0;
+        var maxScroll = container[0].scrollHeight - containerHeight;
+        if (targetScroll > maxScroll) targetScroll = maxScroll;
+
+        if (animate) {
+            container.stop().animate({ scrollTop: targetScroll }, 250);
+        } else {
+            container.scrollTop(targetScroll);
+        }
+    }
+
+    /**
+     * Sinkronisasi indikator aktif di sidebar saat scrolling halaman (ScrollSpy)
+     */
+    function syncSidebarOnScroll() {
+        if (isProgrammaticScroll) return;
+
+        var cards = $('#side-indikator-list .indikator-side-card');
+        if (!cards.length) return;
+
+        var windowScroll = $(window).scrollTop();
+        var windowHeight = $(window).height();
+        var docHeight = $(document).height();
+
+        // 1. Cek jika sudah di ujung bawah halaman (bottom of page), aktifkan indikator terakhir
+        if ((windowScroll + windowHeight) >= (docHeight - 40)) {
+            var lastCard = cards.filter(':visible').last();
+            if (lastCard.length) {
+                var lastId = lastCard.data('id');
+                if (currentActiveIndikatorId !== lastId) {
+                    currentActiveIndikatorId = lastId;
+                    cards.removeClass('active');
+                    lastCard.addClass('active');
+                    var isHoveredLast = $('#side-indikator-list:hover').length > 0;
+                    if (!isHoveredLast) {
+                        scrollSidebarToCard(lastCard, true);
+                    }
+                }
+                return;
+            }
+        }
+
+        var headerHeight = $('.main-header').outerHeight() || 0;
+        var isFixed = $('body').hasClass('fixed') || $('.main-header').css('position') === 'fixed';
+        var topOffset = (isFixed && headerHeight > 0) ? (headerHeight + 110) : 120;
+        var thresholdY = windowScroll + topOffset;
+
+        // Kumpulkan semua section indikator yang ada di halaman
+        var sections = $('.indikator-section-header[data-idindikator]');
+        var activeIndId = null;
+
+        if (sections.length) {
+            sections.each(function () {
+                var sec = $(this);
+                var indId = sec.data('idindikator');
+                var top = sec.offset().top;
+
+                // Hitung batas bawah section (berdasarkan elemen terakhir yang memiliki data-idindikator ini)
+                var relatedBoxes = $('[data-idindikator="' + indId + '"]');
+                var lastBox = relatedBoxes.last();
+                var bottom = lastBox.offset().top + lastBox.outerHeight();
+
+                if (thresholdY >= (top - 50) && thresholdY <= bottom) {
+                    activeIndId = indId;
+                    return false; // Ditemukan, hentikan pencarian
+                } else if (thresholdY < top && !activeIndId) {
+                    // Jika user masih di atas section pertama
+                    activeIndId = indId;
+                    return false;
+                } else if (thresholdY >= (top - 50)) {
+                    // Menjaga indikator terakhir yang sudah dilewati
+                    activeIndId = indId;
+                }
+            });
+        } else {
+            // Fallback ke .rubrik-item-box
+            var boxes = $('.rubrik-item-box[data-idindikator]');
+            boxes.each(function () {
+                var b = $(this);
+                var top = b.offset().top;
+                if (thresholdY >= (top - 50)) {
+                    activeIndId = b.data('idindikator');
+                }
+            });
+        }
+
+        // Jika user masih sangat di atas (misal masih di area header/filter), pilih indikator pertama yang tampil
+        if (!activeIndId) {
+            var firstCard = cards.filter(':visible').first();
+            if (firstCard.length) {
+                activeIndId = firstCard.data('id');
+            }
+        }
+
+        if (activeIndId && currentActiveIndikatorId !== activeIndId) {
+            currentActiveIndikatorId = activeIndId;
+            cards.removeClass('active');
+            var activeCard = $('#side-indikator-list .indikator-side-card[data-id="' + activeIndId + '"]');
+            if (activeCard.length) {
+                activeCard.addClass('active');
+                var isHovered = $('#side-indikator-list:hover').length > 0;
+                if (!isHovered) {
+                    scrollSidebarToCard(activeCard, true);
+                }
+            }
+        }
+    }
+
+    /**
+     * Render Kolom Kiri (Daftar Indikator Navigasi dengan Kriteria Mutu & Sasaran Mutu di dalam setiap Card)
+     */
+    function renderKolomKiri(items) {
+        if (!items || items.length === 0) return;
+
+        // Kelompokkan indikator unik dan aspek di bawah masing-masing indikator
+        var indMap = {};
+        var indList = [];
+
+        $.each(rawJawabanList, function (i, item) {
+            // Filter kriteria jika aktif
+            if (currentFilterKriteria && item.id_kriteria != currentFilterKriteria) return;
+
+            var indId = item.id_indikator;
+            if (!indMap[indId]) {
+                indMap[indId] = {
+                    id_indikator: indId,
+                    nomor_indikator: item.nomor_indikator,
+                    pernyataan_indikator: item.pernyataan_indikator,
+                    justifikasi: item.justifikasi,
+                    is_syarat_unggul: item.is_syarat_unggul_indikator,
+                    id_kriteria: item.id_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    nama_kriteria: item.nama_kriteria,
+                    id_sasaran_mutu: item.id_sasaran_mutu,
+                    kode_sasaran: item.kode_sasaran,
+                    nama_sasaran: item.nama_sasaran,
+                    aspek_map: {}
+                };
+                indList.push(indMap[indId]);
+            }
+
+            var aId = item.id_aspek;
+            if (!indMap[indId].aspek_map[aId]) {
+                indMap[indId].aspek_map[aId] = { total_sub: 0, terisi_sub: 0 };
+            }
+            indMap[indId].aspek_map[aId].total_sub++;
+            if (parseInt(item.is_terisi) === 1) {
+                indMap[indId].aspek_map[aId].terisi_sub++;
+            }
+        });
+
+        $('#side-indikator-count').text(indList.length + ' Indikator');
+
+        var activeId = currentActiveIndikatorId || $('#side-indikator-list .indikator-side-card.active').data('id');
+
+        var html = '';
+        $.each(indList, function (i, ind) {
+            var totalAspek = 0;
+            var terisiAspek = 0;
+            $.each(ind.aspek_map, function (aId, aStat) {
+                totalAspek++;
+                if (aStat.total_sub > 0 && aStat.terisi_sub >= aStat.total_sub) {
+                    terisiAspek++;
+                }
+            });
+
+            var isLengkap = (totalAspek > 0 && terisiAspek >= totalAspek);
+            var statusIcon = '<span class="side-indikator-status-wrap" id="side-ind-status-' + ind.id_indikator + '">' +
+                (isLengkap
+                    ? '<i class="fa fa-check-circle text-success pull-right fs-13" title="Lengkap (' + terisiAspek + '/' + totalAspek + ' Aspek)"></i>'
+                    : '<span class="pull-right badge fs-10 ' + (terisiAspek > 0 ? 'bg-yellow' : 'bg-gray') + '" title="' + terisiAspek + ' dari ' + totalAspek + ' Aspek Terjawab">' + terisiAspek + '/' + totalAspek + '</span>') +
+                '</span>';
+
+            var isActive = (activeId ? (activeId == ind.id_indikator) : (i === 0)) ? ' active' : '';
+            if (isActive && !currentActiveIndikatorId) {
+                currentActiveIndikatorId = ind.id_indikator;
+            }
+
+            html += '<div class="indikator-side-card' + isActive + '" data-id="' + ind.id_indikator + '">';
+
+            // Header dalam Card: Kriteria Mutu & Sasaran Mutu (PPEPP)
+            html += '<div class="side-card-header">' +
+                '<div class="side-card-top">' +
+                '<div class="side-card-title" title="Kriteria: ' + htmlspecialchars(ind.nama_kriteria) + '">' +
+                '<span class="label label-primary fs-9 pad-2-5 margin-r-5">' + htmlspecialchars(ind.nama_kriteria || ind.kode_kriteria) + '</span>' +
+                '</div>' +
+                statusIcon +
+                '</div>' +
+                '<div class="side-card-tags">' +
+                '<span class="label badge-sub-purple pad-1-6 fs-9" title="Sasaran Mutu (PPEPP)">' +
+                '<i class="fa fa-crosshairs"></i> ' + htmlspecialchars(ind.nama_sasaran || 'Sasaran Mutu') +
+                '</span> ' +
+                '<span class="label label-info pad-1-6 fs-9">' +
+                'Indikator ' + ind.nomor_indikator +
+                '</span> ' +
+                (parseInt(ind.is_syarat_unggul) === 1 ? '<span class="label label-warning fs-9 pad-1-6" title="Syarat Perlu"><i class="fa fa-check-circle"></i> Syarat Perlu</span> ' : '') +
+                '</div>' +
+                '</div>';
+
+            // Pernyataan Indikator
+            html += '<div class="side-card-body">' +
+                htmlspecialchars(ind.pernyataan_indikator) +
+                '</div>';
+
+            // Justifikasi / Regulasi jika ada
+            if (ind.justifikasi) {
+                html += '<div class="side-card-footer">' +
+                    '<i class="fa fa-bookmark-o"></i> ' + htmlspecialchars(ind.justifikasi) +
+                    '</div>';
+            }
+
+            html += '</div>';
+        });
+
+        $('#side-indikator-list').html(html);
+
+        // Click indikator di kolom kiri -> scroll ke butir terkait
+        $('#side-indikator-list .indikator-side-card').off('click').on('click', function () {
+            var indId = $(this).data('id');
+            $('#side-indikator-list .indikator-side-card').removeClass('active');
+            $(this).addClass('active');
+            currentActiveIndikatorId = indId;
+
+            // Scroll container sidebar agar card tetap di tengah view
+            scrollSidebarToCard($(this), true);
+
+            var targetHeader = $('#indikator-section-' + indId);
+            var targetBox = targetHeader.length ? targetHeader : $('.rubrik-item-box[data-idindikator="' + indId + '"], .aspek-card[data-idindikator="' + indId + '"]').first();
+            if (targetBox.length) {
+                var headerHeight = $('.main-header').outerHeight() || 0;
+                var isFixed = $('body').hasClass('fixed') || $('.main-header').css('position') === 'fixed';
+                var scrollOffset = (isFixed && headerHeight > 0) ? (headerHeight + 15) : 20;
+
+                isProgrammaticScroll = true;
+                $('html, body').stop().animate({
+                    scrollTop: targetBox.offset().top - scrollOffset
+                }, 400, function () {
+                    setTimeout(function () {
+                        isProgrammaticScroll = false;
+                        syncSidebarOnScroll();
+                    }, 80);
+                });
+
+                targetBox.css('transform', 'scale(1.01)').delay(300).queue(function (next) {
+                    $(this).css('transform', 'none');
+                    next();
+                });
+            }
+        });
+
+        // Terapkan filter pencarian sidebar jika sedang aktif
+        filterSidebarIndikator();
+
+        // Jalankan sinkronisasi awal posisi scroll
+        setTimeout(function () {
+            syncSidebarOnScroll();
+        }, 100);
+    }
+
+    /**
+     * Filter realtime list card indikator pada kolom kiri (sidebar)
+     */
+    function filterSidebarIndikator() {
+        var q = ($('#search-sidebar-indikator').val() || '').toLowerCase().trim();
+        if (q.length > 0) {
+            $('#btn-clear-sidebar-search').show();
+        } else {
+            $('#btn-clear-sidebar-search').hide();
+        }
+
+        var cards = $('#side-indikator-list .indikator-side-card');
+        var total = cards.length;
+        var visibleCount = 0;
+
+        cards.each(function () {
+            var cardText = $(this).text().toLowerCase();
+            var isMatch = (!q || cardText.indexOf(q) >= 0);
+            $(this).toggle(isMatch);
+            if (isMatch) visibleCount++;
+        });
+
+        var emptyEl = $('#side-indikator-search-empty');
+        if (visibleCount === 0 && total > 0) {
+            if (!emptyEl.length) {
+                $('#side-indikator-list').append(
+                    '<div id="side-indikator-search-empty" class="text-center text-muted" style="padding: 20px 10px; font-size: 11.5px;">' +
+                    '<i class="fa fa-search fa-2x text-muted" style="opacity: 0.4; margin-bottom: 8px;"></i><br>' +
+                    '<span>Tidak ada indikator yang cocok dengan kata kunci <b>"' + htmlspecialchars(q) + '"</b></span>' +
+                    '</div>'
+                );
+            } else {
+                emptyEl.find('b').text('"' + q + '"');
+                emptyEl.show();
+            }
+        } else if (emptyEl.length) {
+            emptyEl.hide();
+        }
+
+        if (q) {
+            $('#side-indikator-count').text(visibleCount + ' / ' + total + ' Indikator');
+        } else {
+            $('#side-indikator-count').text(total + ' Indikator');
+        }
+    }
+
+    /**
+     * Filter data items sesuai Kriteria, Status Isian, dan Search
+     */
+    function filterItems() {
+        return $.grep(rawJawabanList, function (item) {
+            // Filter Kriteria
+            if (currentFilterKriteria && item.id_kriteria != currentFilterKriteria) {
+                return false;
+            }
+
+            // Filter Status Isian
+            var isTerisi = (parseInt(item.is_terisi) === 1);
+            var isWajib = (parseInt(item.is_mandatory) === 1);
+
+            if (currentFilterStatus === 'belum' && isTerisi) {
+                return false;
+            }
+            if (currentFilterStatus === 'sudah' && !isTerisi) {
+                return false;
+            }
+            if (currentFilterStatus === 'wajib' && !isWajib) {
+                return false;
+            }
+
+            // Filter Search Kata Kunci
+            if (currentSearch) {
+                var varNames = '';
+                if (item.variabel_list && item.variabel_list.length > 0) {
+                    $.each(item.variabel_list, function (vi, v) {
+                        varNames += ' ' + (v.kode_variabel || '') + ' ' + (v.nama_variabel || '') + ' ' + (v.deskripsi || '');
+                    });
+                }
+                var haystack = (
+                    (item.kode_aspek || '') + ' ' +
+                    (item.kode_sub_aspek || '') + ' ' +
+                    (item.deskripsi_aspek || '') + ' ' +
+                    (item.pernyataan_sub_aspek || '') + ' ' +
+                    (item.catatan_unit || '') +
+                    varNames
+                ).toLowerCase();
+
+                if (haystack.indexOf(currentSearch) === -1) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+    }
+
+    /**
+     * Bind form actions, radio change, dan auto-save
+     */
+    function bindFormHandlers() {
+        // Klik radio card pilihan skala
+        $('.opsi-radio-card input[type="radio"]').on('change', function () {
+            var label = $(this).closest('.opsi-radio-card');
+            label.closest('.opsi-skala-group').find('.opsi-radio-card').removeClass('selected');
+            label.addClass('selected');
+
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+
+            // Trigger auto-save langsung saat opsi skala dipilih
+            saveJawabanItem(idjawaban, false);
+        });
+
+        // Input angka kuantitatif realtime validasi & debounce save
+        $('.input-kuantitatif').on('input', function () {
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+            var val = $(this).val();
+            var targetCheck = $('#target-check-' + idjawaban);
+            if (targetCheck.length) {
+                var itm = null;
+                $.each(rawJawabanList, function (_, item) {
+                    if (item.id_penugasan_jawaban == idjawaban) {
+                        itm = item;
+                        return false;
+                    }
+                });
+                if (itm && itm.operator_pembanding && itm.nilai_target_min) {
+                    targetCheck.html(checkTargetFulfilled(val, itm.operator_pembanding, itm.nilai_target_min, itm.nilai_target_max));
+                }
+            }
+
+            debounceSave(idjawaban);
+        });
+
+        // Textarea auto-save debounce
+        $('.jawaban-content-panel textarea').on('input', function () {
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+            debounceSave(idjawaban);
+        });
+
+        // Tombol manual Simpan Jawaban
+        $('.btn-save-jawaban').on('click', function () {
+            var idjawaban = $(this).data('id');
+            saveJawabanItem(idjawaban, true);
+        });
+
+        // Modal Upload Bukti
+        $('.btn-modal-bukti').off('click').on('click', function () {
+            var idjawaban = $(this).data('id');
+            var subKode = $(this).data('subkode');
+            $('#form-upload-bukti')[0].reset();
+            $('#modal-upload-bukti [name="id_penugasan_jawaban"]').val(idjawaban);
+            $('#modal-upload-bukti [name="idpenugasan"]').val(idpenugasan);
+            $('#modal-sub-aspek-info').text(subKode);
+            $('input[name="tipe_bukti_pilihan"][value="file"]').prop('checked', true);
+            $('#group-input-file').show();
+            $('#group-input-url').hide();
+            $('#modal-upload-bukti').modal('show');
+        });
+
+        // Hapus Bukti
+        $('.btn-delete-bukti').on('click', function () {
+            var idbukti = $(this).data('idbukti');
+            var idjawaban = $(this).data('idjawaban');
+            deleteBukti(idbukti, idjawaban);
+        });
+    }
+
+    /**
+     * Debounce Auto-Save agar tidak spam request saat user mengetik
+     */
+    function debounceSave(idjawaban) {
+        $('#save-status-' + idjawaban).html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+
+        if (saveDebounceTimers[idjawaban]) {
+            clearTimeout(saveDebounceTimers[idjawaban]);
+        }
+
+        saveDebounceTimers[idjawaban] = setTimeout(function () {
+            saveJawabanItem(idjawaban, false);
+        }, 900);
+    }
+
+    /**
+     * Eksekusi AJAX Penyimpanan Jawaban Per Butir
+     */
+    function saveJawabanItem(idjawaban, isManualClick) {
+        if (isLocked) {
+            var statusLabel = $('#save-status-' + idjawaban);
+            statusLabel.html('<i class="fa fa-lock text-muted"></i> Terkunci');
+            return;
+        }
+
+        var form = $('#form-jawaban-' + idjawaban);
+        if (!form.length) return;
+
+        // Input nilai otomatis (readonly, hasil rumus) bukan isian pengguna: tidak boleh ikut dikirim,
+        // jika tidak, mengetik catatan saja akan menimpa nilai hasil kompilasi dengan angka yang tampil di layar.
+        var sendFields = form.find(':input').not('.input-nilai-otomatis');
+        var formData = sendFields.serialize();
+        var statusLabel = $('#save-status-' + idjawaban);
+        statusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+
+        // Deteksi secara lokal apakah form memiliki isian jawaban (angka, teks, catatan, atau bukti)
+        var formFields = sendFields.serializeArray();
+        var hasFilledValue = false;
+        var newNilaiKuantitatif = null;
+        var newTeksJawaban = null;
+        var newCatatanUnit = null;
+
+        var currentItem = null;
+        $.each(rawJawabanList, function (_, itm) {
+            if (itm.id_penugasan_jawaban == idjawaban) {
+                currentItem = itm;
+                return false;
+            }
+        });
+
+        $.each(formFields, function (_, fld) {
+            if (fld.name === 'nilai_kuantitatif' && fld.value !== '') {
+                hasFilledValue = true;
+                newNilaiKuantitatif = fld.value;
+            }
+            if (fld.name === 'teks_jawaban' && fld.value.trim() !== '') {
+                hasFilledValue = true;
+                newTeksJawaban = fld.value;
+            }
+            if (fld.name === 'catatan_unit') {
+                newCatatanUnit = fld.value;
+                if (fld.value.trim() !== '') {
+                    hasFilledValue = true;
+                }
+            }
+        });
+
+        if (currentItem) {
+            var hasCatatan = (newCatatanUnit !== null ? (newCatatanUnit.trim() !== '') : (currentItem.catatan_unit && currentItem.catatan_unit.trim() !== ''));
+            if (currentItem.tipe_jawaban === 'dokumen') {
+                hasFilledValue = (currentItem.bukti_dukung && currentItem.bukti_dukung.length > 0) || hasCatatan;
+            } else if (currentItem.tipe_jawaban === 'sumber_data') {
+                hasFilledValue = (currentItem.nilai_kuantitatif !== null && currentItem.nilai_kuantitatif !== undefined && currentItem.nilai_kuantitatif !== '') || hasCatatan;
+            } else if (currentItem.tipe_jawaban === 'data_manual') {
+                var curValK = (newNilaiKuantitatif !== null) ? newNilaiKuantitatif : currentItem.nilai_kuantitatif;
+                hasFilledValue = (curValK !== null && curValK !== undefined && curValK !== '') || hasCatatan;
+            } else {
+                hasFilledValue = hasFilledValue || hasCatatan;
+            }
+        }
+
+        // Update lokal memori dan visual secara instan (Optimistic Update)
+        var itemIndex = -1;
+        $.each(rawJawabanList, function (idx, itm) {
+            if (itm.id_penugasan_jawaban == idjawaban) {
+                itemIndex = idx;
+                return false;
+            }
+        });
+
+        if (itemIndex >= 0) {
+            rawJawabanList[itemIndex].is_terisi = hasFilledValue ? 1 : 0;
+            if (newNilaiKuantitatif !== null) rawJawabanList[itemIndex].nilai_kuantitatif = newNilaiKuantitatif;
+            if (newTeksJawaban !== null) rawJawabanList[itemIndex].teks_jawaban = newTeksJawaban;
+            if (newCatatanUnit !== null) rawJawabanList[itemIndex].catatan_unit = newCatatanUnit;
+
+            // Update status visual sub-row & badge
+            var subRow = $('#box-item-' + idjawaban);
+            if (hasFilledValue) {
+                subRow.removeClass('sub-wajib-belum sub-belum-diisi').addClass('sub-terisi');
+                $('#sub-status-badge-' + idjawaban).replaceWith(subStatusHtml(idjawaban, true, false));
+            } else {
+                subRow.removeClass('sub-terisi').addClass('sub-belum-diisi');
+                $('#sub-status-badge-' + idjawaban).replaceWith(subStatusHtml(idjawaban, false, parseInt(rawJawabanList[itemIndex].is_mandatory) === 1));
+            }
+
+            // Update parent aspect card status & counter
+            updateAspekCardStatus(rawJawabanList[itemIndex].id_aspek);
+
+            // Update status indikator di sidebar kolom kiri
+            updateSidebarIndikatorStatus(rawJawabanList[itemIndex].id_indikator);
+
+            // Update Progress Bar seketika
+            updateProgressBar();
+        }
+
+        // Penanda versi yang dilihat pengguna, untuk mendeteksi perubahan oleh orang lain di server
+        if (currentItem && currentItem.updated_at) {
+            formData += '&updated_at_client=' + encodeURIComponent(currentItem.updated_at);
+        }
+
+        $('body').loading('start');
+
+        $.ajax({
+            url: appBaseUrl + '/penugasan/rubrik_save_jawaban',
+            type: 'POST',
+            data: formData,
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status) {
+                statusLabel.html('<i class="fa fa-check-circle text-success"></i> Tersimpan');
+
+                if (itemIndex >= 0 && res.data && res.data.updated_at) {
+                    rawJawabanList[itemIndex].updated_at = res.data.updated_at;
+                    rawJawabanList[itemIndex].updated_by = res.data.updated_by;
+                }
+
+                if (itemIndex >= 0) {
+                    updateAspekCardStatus(rawJawabanList[itemIndex].id_aspek);
+                    updateSidebarIndikatorStatus(rawJawabanList[itemIndex].id_indikator);
+                }
+
+                // Update Progress Bar dari respons server jika tersedia, fallback ke lokal
+                if (res.data && res.data.progress) {
+                    applyProgressData(res.data.progress);
+                } else {
+                    updateProgressBar();
+                }
+
+                if (isManualClick) {
+                    swal({
+                        title: 'Tersimpan!',
+                        text: 'Jawaban butir rubrik berhasil disimpan.',
+                        icon: 'success',
+                        timer: 1500,
+                        buttons: false
+                    });
+                }
+            } else if (res && res.data && res.data.conflict) {
+                statusLabel.html('<i class="fa fa-exclamation-triangle text-warning"></i> Konflik');
+                swal({
+                    title: 'Isian diubah pengguna lain',
+                    text: res.message + '\n\nIsian yang baru Anda ketik belum tersimpan.',
+                    icon: 'warning',
+                    buttons: { cancel: 'Tutup', confirm: 'Muat ulang sekarang' }
+                }).then(function (reload) {
+                    if (reload) loadRubrikData();
+                });
+            } else {
+                statusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Gagal');
+                if (isManualClick) {
+                    swal('Gagal', res && res.message ? res.message : 'Tidak dapat menyimpan isian.', 'error');
+                }
+            }
+        }).fail(function () {
+            statusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Error');
+            if (isManualClick) {
+                swal('Error', 'Terjadi gangguan jaringan saat menyimpan.', 'error');
+            }
+        }).always(function () {
+            $('body').loading('stop');
+        });
+    }
+
+    /**
+     * Memperbarui visual status header dan badge pada card aspek
+     */
+    function updateAspekCardStatus(idAspek) {
+        if (!idAspek) return;
+
+        var totalSubInAspek = 0;
+        var terisiSubInAspek = 0;
+        var hasUnfilledWajibInAspek = false;
+
+        $.each(rawJawabanList, function (rIdx, rItem) {
+            if (rItem.id_aspek == idAspek) {
+                totalSubInAspek++;
+                var rTerisi = (parseInt(rItem.is_terisi) === 1);
+                var rWajib = (parseInt(rItem.is_mandatory) === 1);
+
+                if (rTerisi) {
+                    terisiSubInAspek++;
+                } else if (rWajib) {
+                    hasUnfilledWajibInAspek = true;
+                }
+            }
+        });
+
+        var isAllTerisi = (totalSubInAspek > 0 && terisiSubInAspek >= totalSubInAspek);
+        var card = $('#aspek-card-' + idAspek);
+        if (!card.length) return;
+
+        if (isAllTerisi) {
+            card.removeClass('status-belum-diisi wajib-item').addClass('status-sudah-diisi');
+        } else {
+            card.removeClass('status-sudah-diisi').addClass('status-belum-diisi');
+            if (hasUnfilledWajibInAspek) card.addClass('wajib-item'); else card.removeClass('wajib-item');
+        }
+        $('#aspek-status-header-' + idAspek).html(aspekStatusHtml(terisiSubInAspek, totalSubInAspek, hasUnfilledWajibInAspek));
+    }
+
+    /**
+     * Memperbarui visual status badge pada card indikator di sidebar kolom kiri
+     * Berdasarkan jumlah aspek terjawab / jumlah total aspek
+     */
+    function updateSidebarIndikatorStatus(idIndikator) {
+        if (!idIndikator) return;
+
+        var aspekMap = {};
+        $.each(rawJawabanList, function (i, item) {
+            if (item.id_indikator == idIndikator) {
+                var aId = item.id_aspek;
+                if (!aspekMap[aId]) {
+                    aspekMap[aId] = { total_sub: 0, terisi_sub: 0 };
+                }
+                aspekMap[aId].total_sub++;
+                if (parseInt(item.is_terisi) === 1) {
+                    aspekMap[aId].terisi_sub++;
+                }
+            }
+        });
+
+        var totalAspek = 0;
+        var terisiAspek = 0;
+        $.each(aspekMap, function (aId, aStat) {
+            totalAspek++;
+            if (aStat.total_sub > 0 && aStat.terisi_sub >= aStat.total_sub) {
+                terisiAspek++;
+            }
+        });
+
+        var isLengkap = (totalAspek > 0 && terisiAspek >= totalAspek);
+        var newStatusHtml = isLengkap
+            ? '<i class="fa fa-check-circle text-success pull-right fs-13" title="Lengkap (' + terisiAspek + '/' + totalAspek + ' Aspek)"></i>'
+            : '<span class="pull-right badge fs-10 ' + (terisiAspek > 0 ? 'bg-yellow' : 'bg-gray') + '" title="' + terisiAspek + ' dari ' + totalAspek + ' Aspek Terjawab">' + terisiAspek + '/' + totalAspek + '</span>';
+
+        var wrap = $('#side-ind-status-' + idIndikator);
+        if (wrap.length) {
+            wrap.html(newStatusHtml);
+        } else {
+            var card = $('#side-indikator-list .indikator-side-card[data-id="' + idIndikator + '"]');
+            var existingBadge = card.find('.pull-right');
+            if (existingBadge.length) {
+                existingBadge.replaceWith(newStatusHtml);
+            }
+        }
+    }
+
+    /**
+     * Memperbarui seluruh indikator di sidebar kolom kiri secara massal
+     */
+    function updateAllSidebarIndikatorStatus() {
+        var indIds = {};
+        $.each(rawJawabanList, function (i, item) {
+            indIds[item.id_indikator] = true;
+        });
+
+        $.each(indIds, function (indId) {
+            updateSidebarIndikatorStatus(indId);
+        });
+    }
+
+    /**
+     * Submit Bukti Dukung (File Fisik via FormData atau Tautan URL)
+     */
+    function submitUploadBukti() {
+        var formElement = $('#form-upload-bukti')[0];
+        var idjawaban = $('#modal-upload-bukti [name="id_penugasan_jawaban"]').val();
+        var formData = new FormData(formElement);
+
+        if (!formData.get('id_penugasan_jawaban') && idjawaban) {
+            formData.set('id_penugasan_jawaban', idjawaban);
+        }
+        if (!formData.get('idpenugasan') && idpenugasan) {
+            formData.set('idpenugasan', idpenugasan);
+        }
+
+        var tipePilihan = $('input[name="tipe_bukti_pilihan"]:checked').val();
+        if (tipePilihan === 'url') {
+            var urlVal = $('#modal-upload-bukti [name="url_eksternal"]').val();
+            if (!urlVal) {
+                swal('Peringatan', 'Silakan masukkan tautan URL dokumen bukti dukung!', 'warning');
+                return;
+            }
+        } else {
+            var fileInput = $('#modal-upload-bukti [name="file"]')[0];
+            var fileVal = $('#modal-upload-bukti [name="file"]').val();
+            if (!fileVal) {
+                swal('Peringatan', 'Silakan pilih berkas file yang akan diunggah!', 'warning');
+                return;
+            }
+            if (fileInput && fileInput.files && fileInput.files[0]) {
+                var maxBytes = 10 * 1024 * 1024; // 10 MB
+                if (fileInput.files[0].size > maxBytes) {
+                    swal('Peringatan', 'Ukuran berkas melebihi batas maksimal 10 MB! Silakan pilih file yang lebih kecil.', 'warning');
+                    return;
+                }
+            }
+        }
+
+        $('#btn-submit-bukti').prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Mengunggah...');
+        $('body').loading('start');
+
+        $.ajax({
+            url: appBaseUrl + '/penugasan/rubrik_upload_bukti',
+            type: 'POST',
+            data: formData,
+            processData: false,
+            contentType: false,
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status) {
+                $('#modal-upload-bukti').modal('hide');
+                swal('Berhasil', 'Bukti dukung berhasil ditambahkan.', 'success');
+                // Refresh data butir
+                loadRubrikData();
+            } else {
+                swal('Gagal', res && res.message ? res.message : 'Gagal mengunggah bukti.', 'error');
+            }
+        }).fail(function () {
+            swal('Error', 'Terjadi kesalahan sistem saat mengunggah berkas.', 'error');
+        }).always(function () {
+            $('body').loading('stop');
+            $('#btn-submit-bukti').prop('disabled', false).html('<i class="fa fa-upload"></i> Simpan Bukti Dukung');
+        });
+    }
+
+    /**
+     * Hapus Bukti Dukung
+     */
+    function deleteBukti(idbukti, idjawaban) {
+        swal({
+            title: 'Hapus Bukti Dukung?',
+            text: 'Dokumen bukti ini akan dihapus dari butir rubrik.',
+            icon: 'warning',
+            buttons: ['Batal', 'Ya, Hapus!'],
+            dangerMode: true,
+        }).then(function (willDelete) {
+            if (willDelete) {
+                $('body').loading('start');
+                $.ajax({
+                    url: appBaseUrl + '/penugasan/rubrik_delete_bukti',
+                    type: 'POST',
+                    data: { id_bukti: idbukti },
+                    dataType: 'json'
+                }).done(function (res) {
+                    if (res && res.status) {
+                        $('#bukti-item-' + idbukti).fadeOut(300, function () { $(this).remove(); });
+                        // Refresh data
+                        loadRubrikData();
+                    } else {
+                        swal('Gagal', res && res.message ? res.message : 'Gagal menghapus bukti.', 'error');
+                    }
+                }).fail(function () {
+                    swal('Error', 'Gangguan koneksi server.', 'error');
+                }).always(function () {
+                    $('body').loading('stop');
+                });
+            }
+        });
+    }
+
+    /**
+     * Perbarui Indikator Progress Bar secara Real-Time
+     */
+    function updateProgressBar() {
+        var totalWajib = 0;
+        var terisiWajib = 0;
+        var totalSemua = rawJawabanList.length;
+        var terisiSemua = 0;
+
+        $.each(rawJawabanList, function (i, item) {
+            var isWajib = (parseInt(item.is_mandatory) === 1);
+            var isTerisi = (parseInt(item.is_terisi) === 1);
+
+            if (isTerisi) terisiSemua++;
+            if (isWajib) {
+                totalWajib++;
+                if (isTerisi) terisiWajib++;
+            }
+        });
+
+        var persenWajib = totalWajib > 0 ? Math.round((terisiWajib / totalWajib) * 100) : 0;
+        applyProgressData({
+            total_wajib: totalWajib,
+            terisi_wajib: terisiWajib,
+            persen_wajib: persenWajib,
+            total_butir: totalSemua,
+            terisi_butir: terisiSemua,
+            is_lengkap_wajib: (totalWajib > 0 && terisiWajib >= totalWajib) ? 1 : 0
+        });
+    }
+
+    /**
+     * Menerapkan data objek progress ke elemen DOM
+     */
+    function applyProgressData(p) {
+        var persen = parseFloat(p.persen_wajib) || 0;
+        $('#progress-bar-wajib').css('width', persen + '%').attr('aria-valuenow', persen);
+        $('#progress-wajib-text').text(persen + '%');
+        $('#progress-wajib-desc').text(p.terisi_wajib + ' dari ' + p.total_wajib + ' butir wajib sudah diisi');
+
+        $('#chip-wajib-terisi').text(p.terisi_wajib + ' / ' + p.total_wajib);
+        $('#chip-total-terisi').text(p.terisi_butir + ' / ' + p.total_butir);
+
+        if (p.is_lengkap_wajib == 1 || (p.total_wajib > 0 && p.terisi_wajib >= p.total_wajib)) {
+            $('#progress-bar-wajib').removeClass('progress-bar-primary progress-bar-warning').addClass('progress-bar-success');
+            $('#chip-status-kelengkapan').html('<i class="fa fa-check-circle text-success"></i> Lengkap').removeClass('text-warning text-danger').addClass('text-success');
+        } else if (p.terisi_wajib > 0) {
+            $('#progress-bar-wajib').removeClass('progress-bar-success progress-bar-danger').addClass('progress-bar-warning');
+            $('#chip-status-kelengkapan').html('<i class="fa fa-clock-o text-warning"></i> Proses').removeClass('text-success text-danger').addClass('text-warning');
+        } else {
+            $('#progress-bar-wajib').removeClass('progress-bar-success progress-bar-warning').addClass('progress-bar-danger');
+            $('#chip-status-kelengkapan').html('<i class="fa fa-exclamation-circle text-danger"></i> Belum Diisi').removeClass('text-success text-warning').addClass('text-danger');
+        }
+    }
+
+    /**
+     * Helper cek target kuantitatif
+     */
+    function checkTargetFulfilled(val, operator, target, target_max) {
+        if (val === '' || val === null || val === undefined) return '';
+        var num = parseFloat(val);
+        var tgt = parseFloat(target);
+        var tgt_max = parseFloat(target_max);
+        if (isNaN(num) || isNaN(tgt)) return '';
+
+        var passed = false;
+        if (operator === '>=' && num >= tgt) passed = true;
+        else if (operator === '>' && num > tgt) passed = true;
+        else if (operator === '<=' && num <= tgt) passed = true;
+        else if (operator === '<' && num < tgt) passed = true;
+        else if (operator === '=' && num === tgt) passed = true;
+        else if (operator === 'BETWEEN' && num <= tgt_max && num >= tgt) passed = true;
+
+        var tgtDesc = (operator === 'BETWEEN') ? (tgt + ' s/d ' + (isNaN(tgt_max) ? '?' : tgt_max)) : (operator + ' ' + tgt);
+        if (passed) {
+            return '<small class="text-success font-bold"><i class="fa fa-check"></i> Memenuhi Target (' + tgtDesc + ')</small>';
+        } else {
+            return '<small class="text-danger font-bold"><i class="fa fa-times"></i> Belum Memenuhi Target (' + tgtDesc + ')</small>';
+        }
+    }
+
+    // =========================================================================
+    // AUTOMASI NILAI SUB-ASPEK DARI REFERENSI VARIABEL & RUMUS
+    // =========================================================================
+
+    /**
+     * Membuka modal preview dan kalkulasi automasi rumus
+     */
+    function openAutomasiModal() {
+        $('#modal-preview-automasi').modal('show');
+        loadAutomasiPreview();
+    }
+
+    var automasiPreviewData = [];
+
+    function loadAutomasiPreview() {
+        $('#auto-preview-tbody').html(
+            '<tr><td colspan="7" class="text-center text-muted pad-30">' +
+            '<i class="fa fa-spinner fa-spin fa-2x text-primary"></i>' +
+            '<p class="margin-top-10">Menganalisis butir rumus dan variabel referensi unit...</p>' +
+            '</td></tr>'
+        );
+        $('#btn-apply-automasi-terpilih').prop('disabled', true);
+        $('#auto-count-apply').text(0);
+        $('#auto-summary-total-rumus').html('<i class="fa fa-calculator"></i> Memuat...');
+        $('#auto-summary-terpenuhi').html('<i class="fa fa-check-circle"></i> Memuat...');
+
+        $.ajax({
+            url: appBaseUrl + '/penugasan/rubrik_compile_preview',
+            type: 'GET',
+            data: { idpenugasan: idpenugasan },
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status && res.data) {
+                var d = res.data;
+                automasiPreviewData = d.items || [];
+                renderAutomasiPreview(automasiPreviewData);
+            } else {
+                var msg = (res && res.message) ? res.message : 'Gagal memuat analisis rumus.';
+                $('#auto-preview-tbody').html(
+                    '<tr><td colspan="7" class="text-center text-muted pad-25">' +
+                    '<i class="fa fa-info-circle fa-2x text-warning"></i>' +
+                    '<p class="margin-top-8 text-semibold">' + htmlspecialchars(msg) + '</p>' +
+                    '</td></tr>'
+                );
+                $('#auto-summary-total-rumus').html('<i class="fa fa-calculator"></i> 0 Butir Rumus');
+                $('#auto-summary-terpenuhi').html('<i class="fa fa-check-circle"></i> 0 Terpenuhi');
+            }
+        }).fail(function () {
+            $('#auto-preview-tbody').html(
+                '<tr><td colspan="7" class="text-center text-danger pad-25">' +
+                '<i class="fa fa-times-circle fa-2x"></i>' +
+                '<p class="margin-top-8">Gagal terhubung ke server untuk kalkulasi rumus.</p>' +
+                '</td></tr>'
+            );
+        });
+    }
+
+    function renderAutomasiPreview(items) {
+        if (!items || items.length === 0) {
+            $('#auto-preview-tbody').html(
+                '<tr><td colspan="7" class="text-center text-muted pad-25">' +
+                '<i class="fa fa-info-circle fa-2x text-info"></i>' +
+                '<p class="margin-top-8">Tidak ditemukan butir sub-aspek yang memiliki rumus kalkulasi pada instrumen ini.</p>' +
+                '</td></tr>'
+            );
+            $('#auto-summary-total-rumus').html('<i class="fa fa-calculator"></i> 0 Butir Rumus');
+            $('#auto-summary-terpenuhi').html('<i class="fa fa-check-circle"></i> 0 Terpenuhi');
+            $('#btn-apply-automasi-terpilih').prop('disabled', true);
+            return;
+        }
+
+        var html = '';
+        var totalMet = 0;
+
+        $.each(items, function (idx, item) {
+            var isChildNotFound = !!item.child_unit_not_found;
+            var isMet = !isChildNotFound && (item.target_terpenuhi === true);
+            if (isMet) totalMet++;
+
+            var varPills = [];
+            if (isChildNotFound) {
+                var missingMsg = item.child_unit_message || ('Tidak ada unit (' + (item.target_unit_label || 'bawahan') + ')');
+                varPills.push('<span class="label label-warning fs-11" title="Unit anak tidak ditemukan">' +
+                    '<i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(missingMsg) + '</span>');
+            } else if (item.variabel_digunakan) {
+                $.each(item.variabel_digunakan, function (k, v) {
+                    varPills.push('<span class="label label-default font-monospace fs-11 margin-r-5">' +
+                        htmlspecialchars(k) + ' = <b>' + (v !== null ? v : 0) + '</b></span>');
+                });
+            }
+            var varHtml = varPills.length > 0 ? varPills.join(' ') : '<span class="text-muted">-</span>';
+
+            var nilaiSkrg = '-';
+            if (item.nilai_sebelumnya !== null && item.nilai_sebelumnya !== undefined && item.nilai_sebelumnya !== '') {
+                nilaiSkrg = '<b>' + item.nilai_sebelumnya + '</b>' + (item.satuan ? ' ' + htmlspecialchars(item.satuan) : '');
+            } else {
+                nilaiSkrg = '<span class="text-muted font-italic">Kosong</span>';
+            }
+
+            var hasilHitungHtml = '';
+            if (isChildNotFound) {
+                var missingMsg = item.child_unit_message || ('Tidak ada unit (' + (item.target_unit_label || 'bawahan') + ')');
+                hasilHitungHtml = '<span class="badge bg-gray text-muted badge-calc-result" title="Tidak dapat dihitung karena unit anak tidak ada">-</span>' +
+                    '<div class="text-warning font-bold fs-10 margin-top-2"><i class="fa fa-info-circle"></i> ' + htmlspecialchars(missingMsg) + '</div>';
+            } else {
+                hasilHitungHtml = '<span class="badge bg-blue badge-calc-result">' +
+                    (item.nilai_hasil_hitung !== null && item.nilai_hasil_hitung !== undefined ? item.nilai_hasil_hitung : '-') +
+                    (item.satuan && item.nilai_hasil_hitung !== null ? ' ' + htmlspecialchars(item.satuan) : '') + '</span>';
+            }
+
+            var targetHtml = '';
+            if (isChildNotFound) {
+                targetHtml = '<span class="label label-default fs-11 text-muted">Tidak Berlaku</span>';
+            } else if (item.target_terpenuhi === true) {
+                targetHtml += '<div><span class="label label-success"><i class="fa fa-check"></i> Memenuhi Target</span></div>';
+            } else if (item.target_terpenuhi === false) {
+                targetHtml += '<div><span class="label label-danger"><i class="fa fa-times"></i> Belum Memenuhi</span></div>';
+            }
+
+            if (!isChildNotFound && item.opsi_rekomendasi && item.opsi_rekomendasi.label_opsi) {
+                targetHtml += '<div class="margin-top-1"><small class="text-primary font-bold"><i class="fa fa-info-circle"></i> Rekomendasi: ' +
+                    htmlspecialchars(item.opsi_rekomendasi.label_opsi) + '</small></div>';
+            }
+
+            html += '<tr class="' + (isChildNotFound ? 'warning-row bg-warning-light' : '') + '">';
+            html += '<td class="text-center valign-middle">' +
+                '<input type="checkbox" class="chk-auto-item" data-id-jawaban="' + item.id_penugasan_jawaban + '"' + (isChildNotFound ? '' : ' checked') + '>' +
+                '</td>';
+            html += '<td class="valign-middle"><span class="label label-primary font-monospace fs-11">Butir ' + htmlspecialchars(item.sub_nomor_urut || item.nomor_urut || '') + '</span></td>';
+            html += '<td class="valign-middle">' +
+                '<div class="text-semibold margin-bottom-5">' + htmlspecialchars(item.pernyataan_sub_aspek) + '</div>' +
+                '<code class="code-pill"><i class="fa fa-calculator text-muted"></i> ' + htmlspecialchars(item.rumus) + '</code>' +
+                '</td>';
+            html += '<td class="valign-middle">' + varHtml + '</td>';
+            html += '<td class="text-center valign-middle">' + nilaiSkrg + '</td>';
+            html += '<td class="text-center valign-middle ' + (isChildNotFound ? 'bg-warning-light' : 'bg-highlight-blue') + '">' + hasilHitungHtml + '</td>';
+            html += '<td class="text-center valign-middle">' + targetHtml + '</td>';
+            html += '</tr>';
+        });
+
+        $('#auto-preview-tbody').html(html);
+        $('#auto-summary-total-rumus').html('<i class="fa fa-calculator"></i> ' + items.length + ' Butir Ditemukan');
+        $('#auto-summary-terpenuhi').html('<i class="fa fa-check-circle"></i> ' + totalMet + ' Target Terpenuhi');
+
+        updateSelectedAutoCount();
+
+        // Bind event checkbox item
+        $('.chk-auto-item').on('change', function () {
+            updateSelectedAutoCount();
+        });
+    }
+
+    function updateSelectedAutoCount() {
+        var total = $('.chk-auto-item').length;
+        var checked = $('.chk-auto-item:checked').length;
+        $('#auto-count-apply').text(checked);
+        $('#chk-auto-all').prop('checked', total > 0 && checked === total);
+        $('#btn-apply-automasi-terpilih').prop('disabled', checked === 0);
+    }
+
+    function applyAutomasiNilai() {
+        var selectedIds = [];
+        $('.chk-auto-item:checked').each(function () {
+            selectedIds.push($(this).data('id-jawaban'));
+        });
+
+        if (selectedIds.length === 0) {
+            swal('Peringatan', 'Pilih minimal satu butir untuk diterapkan hasilnya.', 'warning');
+            return;
+        }
+
+        var confirmMsg = 'Sistem akan mengisi ' + selectedIds.length + ' butir penilaian mandiri berdasarkan hasil kalkulasi variabel referensi. Lanjutkan?';
+
+        var doExecute = function () {
+            $('body').loading('start');
+            $.ajax({
+                url: appBaseUrl + '/penugasan/rubrik_compile_otomatis',
+                type: 'POST',
+                data: {
+                    idpenugasan: idpenugasan,
+                    selected_ids: JSON.stringify(selectedIds)
+                },
+                dataType: 'json'
+            }).done(function (res) {
+                $('body').loading('stop');
+                if (res && res.status) {
+                    $('#modal-preview-automasi').modal('hide');
+
+                    // Update nilai langsung di frontend untuk butir-butir yang berhasil dikompilasi
+                    if (res.data && res.data.updated_items && res.data.updated_items.length > 0) {
+                        $.each(res.data.updated_items, function (_, upItem) {
+                            var idJ = upItem.id_penugasan_jawaban;
+                            var valK = upItem.nilai_hasil_hitung;
+                            var cat = upItem.catatan_otomatis;
+
+                            // Update input kuantitatif & input otomatis sumber data
+                            var inEl = $('#form-jawaban-' + idJ + ' input[name="nilai_kuantitatif"], #input-nilai-otomatis-' + idJ);
+                            if (upItem.child_unit_not_found || valK === null || valK === undefined) {
+                                if (inEl.length) {
+                                    inEl.val('');
+                                }
+                            } else {
+                                if (inEl.length) {
+                                    inEl.val(parseFloat(valK));
+                                }
+                            }
+
+                            // Update catatan unit
+                            if (cat) {
+                                $('#form-jawaban-' + idJ + ' textarea[name="catatan_unit"]').val(cat);
+                            }
+
+                            // Update target check badge
+                            if (upItem.child_unit_not_found) {
+                                $('#target-check-' + idJ).html('<span class="label label-default fs-11 text-muted">Tidak Berlaku</span>');
+                            } else {
+                                var targetStatus = checkTargetFulfilled(valK, upItem.operator_pembanding, upItem.nilai_target_min, upItem.nilai_target_max);
+                                $('#target-check-' + idJ).html(targetStatus);
+                            }
+
+                            // Update memory di rawJawabanList
+                            $.each(rawJawabanList, function (_, rawItm) {
+                                if (rawItm.id_penugasan_jawaban == idJ) {
+                                    rawItm.nilai_kuantitatif = upItem.child_unit_not_found ? null : valK;
+                                    if (cat) rawItm.catatan_unit = cat;
+                                    rawItm.is_terisi = 1;
+                                    if (upItem.child_unit_not_found) {
+                                        rawItm.child_unit_not_found = true;
+                                        rawItm.target_unit_label = upItem.target_unit_label;
+                                        rawItm.child_unit_message = upItem.child_unit_message;
+                                    }
+                                    if (upItem.variabel_list && upItem.variabel_list.length > 0) {
+                                        rawItm.variabel_list = upItem.variabel_list;
+                                    }
+                                    $('#sub-var-box-' + idJ).replaceWith(renderSubAspekVariabelBox(rawItm));
+                                    updateAspekCardStatus(rawItm.id_aspek);
+                                    updateSidebarIndikatorStatus(rawItm.id_indikator);
+                                    return false;
+                                }
+                            });
+
+                            // Update visual status baris butir
+                            $('#box-item-' + idJ).removeClass('sub-wajib-belum sub-belum-diisi').addClass('sub-terisi');
+                            $('#sub-status-badge-' + idJ).replaceWith('<span class="label label-success" id="sub-status-badge-' + idJ + '"><i class="fa fa-check-circle"></i> Terisi</span>');
+                            if (upItem.child_unit_not_found) {
+                                $('#save-status-' + idJ).html('<i class="fa fa-info-circle text-warning"></i> ' + htmlspecialchars(upItem.child_unit_message || ('Tidak ada unit (' + upItem.target_unit_label + ')')));
+                            } else {
+                                $('#save-status-' + idJ).html('<i class="fa fa-check-circle text-success"></i> Dihitung Otomatis');
+                            }
+                        });
+                        updateProgressBar();
+                    }
+
+                    swal('Berhasil!', res.message || 'Nilai berhasil diterapkan.', 'success');
+                    // Muat ulang data rubrik agar perubahan langsung terlihat
+                    loadRubrikData();
+                } else {
+                    swal('Gagal', (res && res.message) ? res.message : 'Gagal menerapkan nilai kalkulasi.', 'error');
+                }
+            }).fail(function () {
+                $('body').loading('stop');
+                swal('Error', 'Terjadi gangguan komunikasi dengan server.', 'error');
+            });
+        };
+
+        if (typeof swal === 'function') {
+            swal({
+                title: 'Terapkan Hasil Automasi?',
+                text: confirmMsg,
+                icon: 'info',
+                buttons: ['Batal', 'Ya, Terapkan Sekarang!']
+            }).then(function (val) {
+                if (val) doExecute();
+            });
+        } else {
+            if (confirm(confirmMsg)) doExecute();
+        }
+    }
+
+    /**
+     * Render Kotak Variabel Terlampir dan Bar Aksi Perhitungan untuk Sub-Aspek
+     */
+    function renderSubAspekVariabelBox(sub) {
+        if (!sub || !sub.variabel_list || sub.variabel_list.length === 0) {
+            return '';
+        }
+
+        var id = sub.id_penugasan_jawaban;
+        var calcInfo = evaluateSubItemFormula(sub);
+        var calcValDisplay = '-';
+        if (calcInfo && calcInfo.result !== null) {
+            calcValDisplay = '<b>' + calcInfo.result + '</b>' + (sub.satuan ? ' ' + htmlspecialchars(sub.satuan) : '');
+        }
+
+        var html = '<div class="sub-aspek-variabel-box sub-var-box" id="sub-var-box-' + id + '">' +
+            '<div class="row-flex-between margin-bottom-5">' +
+            '<span><i class="fa fa-cubes text-primary"></i> <b class="fs-11 text-slate-700">Variabel Terlampir:</b></span>' +
+            '<div class="row-flex-center gap-6">' +
+            '<span class="badge bg-navy fs-10 text-semibold">' + sub.variabel_list.length + ' Variabel</span>' +
+            '</div>' +
+            '</div>' +
+            '<div class="table-responsive no-margin">' +
+            '<table class="table table-bordered table-condensed bg-white no-margin fs-11">' +
+            '<thead>' +
+            '<tr class="sub-var-table-th">' +
+            '<th class="col-w-80 pad-4-8 text-center">Kode</th>' +
+            '<th class="pad-4-8">Deskripsi Variabel</th>' +
+            '<th class="col-w-110 pad-4-8 text-right">Nilai</th>' +
+            '</tr>' +
+            '</thead>' +
+            '<tbody>';
+
+        $.each(sub.variabel_list, function (vIdx, vItem) {
+            var valDisplay = '-';
+            var isChildNotFound = !!vItem.child_unit_not_found || (vItem.agregasi_info && vItem.agregasi_info.indexOf('Tidak ada unit') !== -1);
+            if (isChildNotFound) {
+                var missingInfo = vItem.agregasi_info || ('Tidak ada unit (' + (vItem.target_unit_label || 'bawahan') + ')');
+                valDisplay = '<span class="label label-warning fs-10 pad-3-6" title="' + htmlspecialchars(missingInfo) + '">' +
+                    '<i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(missingInfo) + '</span>';
+            } else if (vItem.nilai !== null && vItem.nilai !== undefined && vItem.nilai !== '') {
+                var nNum = parseFloat(vItem.nilai);
+                var tooltipSumber = vItem.agregasi_info ? vItem.agregasi_info : (vItem.sumber ? ('Sumber: ' + vItem.sumber) : 'Data variabel');
+                var isChildAgregasi = (vItem.sumber === 'agregasi_child') || !!vItem.agregasi_info;
+                var badgeClass = isChildAgregasi ? 'badge bg-teal fs-11 text-bold pad-3-6' : 'badge bg-blue fs-11 text-bold pad-3-6';
+                valDisplay = '<span class="' + badgeClass + '" title="' + htmlspecialchars(tooltipSumber) + '">' +
+                    nNum + (vItem.satuan ? ' ' + htmlspecialchars(vItem.satuan) : '') + '</span>';
+            } else {
+                valDisplay = '<span class="text-muted font-italic" title="Nilai belum diisi di data variabel">-</span>';
+            }
+
+            var descHtml = '<span class="text-semibold text-navy">' + htmlspecialchars(vItem.nama_variabel || vItem.kode_variabel) + '</span>';
+            if (isChildNotFound) {
+                descHtml += ' <span class="label label-warning fs-9" title="' + htmlspecialchars(vItem.agregasi_info || 'Unit anak tidak ditemukan') + '"><i class="fa fa-exclamation-triangle"></i> Unit Tidak Ada</span>';
+            } else if (vItem.agregasi_info || vItem.sumber === 'agregasi_child') {
+                descHtml += ' <span class="label label-info fs-9" title="' + htmlspecialchars(vItem.agregasi_info || 'Akumulasi dari unit bawahan') + '"><i class="fa fa-sitemap"></i> Akumulasi Unit</span>';
+            }
+            if (vItem.deskripsi && vItem.deskripsi !== vItem.nama_variabel) {
+                descHtml += '<div class="text-muted fs-10 margin-top-1 line-height-130">' + htmlspecialchars(vItem.deskripsi) + '</div>';
+            }
+
+            html += '<tr>' +
+                '<td class="pad-4-8 text-center valign-middle">' +
+                '<span class="label label-primary font-monospace fs-10">' + htmlspecialchars(vItem.kode_variabel) + '</span>' +
+                '</td>' +
+                '<td class="pad-4-8 valign-middle">' +
+                descHtml +
+                '</td>' +
+                '<td class="pad-4-8 text-right valign-middle">' +
+                valDisplay +
+                '</td>' +
+                '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+
+        // Aksi di bawah tabel variabel: Hasil Hitung jika ada rumus, atau info data dukung jika hanya untuk ditampilkan
+        var hasCalc = (sub.rumus_kalkulasi || (calcInfo && calcInfo.result !== null) || (calcInfo && calcInfo.childNotFound));
+        if (hasCalc) {
+            if (calcInfo && calcInfo.childNotFound) {
+                calcValDisplay = '<span class="text-warning fs-11 font-bold" title="' + htmlspecialchars(calcInfo.childNotFoundMessage) + '"><i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(calcInfo.childNotFoundMessage) + '</span>';
+            }
+            html += '<div class="sub-aspek-recalc-box sub-var-action-wrap">' +
+                '<div class="fs-11 text-slate-600">' +
+                '<i class="fa fa-calculator text-primary"></i> <b>Hasil Hitung:</b> ' +
+                '</div>' +
+                '<span class="badge ' + ((calcInfo && calcInfo.childNotFound) ? 'bg-gray' : 'bg-navy') + ' fs-11 text-bold" id="calc-preview-badge-' + id + '">' + calcValDisplay + '</span>' +
+                '<div class="row-flex-center gap-6">' +
+                '<button type="button" class="btn btn-xs btn-primary font-bold btn-shadow-xs btn-refresh-variabel-sub" data-id="' + id + '" title="Refresh nilai variabel dan kalkulasi ulang butir ini">' +
+                '<i class="fa fa-refresh"></i> Refresh Nilai' +
+                '</button>' +
+                '</div>' +
+                '</div>';
+        } else {
+            html += '<div class="sub-aspek-recalc-box sub-var-action-wrap">' +
+                '<small class="text-muted"><i class="fa fa-info-circle text-info"></i> Data variabel di atas dilampirkan sebagai referensi data dukung butir.</small>' +
+                '<button type="button" class="btn btn-xs btn-default btn-refresh-variabel-sub" data-id="' + id + '" title="Refresh nilai variabel sub-aspek ini dari database">' +
+                '<i class="fa fa-refresh"></i> Refresh Nilai' +
+                '</button>' +
+                '</div>';
+        }
+
+        html += '</div>'; // End sub-aspek-variabel-box
+        return html;
+    }
+
+    /**
+     * Evaluasi rumus butir sub-aspek dengan variabel referensi yang tersedia di memori
+     */
+    function evaluateSubItemFormula(sub) {
+        if (!sub) return null;
+        var formula = (sub.rumus_kalkulasi || '').trim();
+        var varList = sub.variabel_list || [];
+
+        // Deteksi apakah butir mengambil data dari child unit dan child unit tidak ditemukan
+        var isChildNotFound = !!sub.child_unit_not_found;
+        var targetLabel = sub.target_unit_label || null;
+        if (!isChildNotFound && varList.length > 0) {
+            $.each(varList, function (_, item) {
+                if (item.child_unit_not_found || (item.agregasi_info && item.agregasi_info.indexOf('Tidak ada unit') !== -1)) {
+                    isChildNotFound = true;
+                    if (item.target_unit_label) targetLabel = item.target_unit_label;
+                    return false;
+                }
+            });
+        }
+
+        if (isChildNotFound) {
+            var notFoundMsg = sub.child_unit_message || ('Tidak ada unit (' + (targetLabel || 'bawahan') + ')');
+            return {
+                result: null,
+                childNotFound: true,
+                targetUnitLabel: targetLabel,
+                childNotFoundMessage: notFoundMsg,
+                hasMissing: true,
+                usedVars: []
+            };
+        }
+
+        // Jika rumus kosong tapi memiliki tepat 1 variabel lampiran, gunakan nilai variabel tersebut
+        if (!formula && varList.length === 1) {
+            var v = varList[0];
+            if (v.nilai !== null && v.nilai !== undefined && v.nilai !== '') {
+                var numVal = parseFloat(v.nilai);
+                return {
+                    result: isNaN(numVal) ? null : numVal,
+                    hasMissing: false,
+                    usedVars: [{ kode: v.kode_variabel, nilai: numVal }]
+                };
+            }
+            return {
+                result: 0,
+                hasMissing: true,
+                usedVars: [{ kode: v.kode_variabel, nilai: null }]
+            };
+        }
+
+        if (!formula) return null;
+
+        var varMap = {};
+        $.each(varList, function (_, item) {
+            var val = (item.nilai !== null && item.nilai !== undefined && item.nilai !== '') ? parseFloat(item.nilai) : null;
+            varMap[(item.kode_variabel || '').toUpperCase()] = val;
+        });
+
+        var expr = formula;
+        var hasMissing = false;
+        var usedVars = [];
+
+        var matchedCodes = formula.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+        var uniqueCodes = [];
+        $.each(matchedCodes, function (_, c) {
+            var uc = c.toUpperCase();
+            if (uniqueCodes.indexOf(uc) === -1) uniqueCodes.push(uc);
+        });
+        uniqueCodes.sort(function (a, b) { return b.length - a.length; });
+
+        $.each(uniqueCodes, function (_, code) {
+            var val = (varMap[code] !== undefined && varMap[code] !== null) ? varMap[code] : null;
+            if (val === null) hasMissing = true;
+            var num = (val !== null) ? val : 0;
+            usedVars.push({ kode: code, nilai: val });
+
+            var reg = new RegExp('\\b' + code + '\\b', 'gi');
+            expr = expr.replace(reg, num);
+        });
+
+        var sanitized = expr.replace(/[^0-9\+\-\*\/\(\)\.\s]/g, '');
+        if (!sanitized || /[^0-9\+\-\*\/\(\)\.\s]/.test(sanitized)) {
+            return null;
+        }
+
+        try {
+            var calcRes = Function('"use strict"; return (' + sanitized + ')')();
+            if (typeof calcRes === 'number' && isFinite(calcRes)) {
+                var rounded = Math.round(calcRes * 10000) / 10000;
+                return {
+                    result: rounded,
+                    hasMissing: hasMissing,
+                    usedVars: usedVars,
+                    sanitizedExpr: sanitized
+                };
+            }
+        } catch (e) {
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Kalkulasi Ulang Butir Sub-Aspek ke Nilai Perhitungan Rumus/Variabel
+     */
+    function recalculateSingleItem(idjawaban, skipConfirm) {
+        var itm = null;
+        var itmIndex = -1;
+        $.each(rawJawabanList, function (idx, item) {
+            if (item.id_penugasan_jawaban == idjawaban) {
+                itm = item;
+                itmIndex = idx;
+                return false;
+            }
+        });
+
+        if (!itm) {
+            swal('Error', 'Data butir penilaian tidak ditemukan.', 'error');
+            return;
+        }
+
+        var calc = evaluateSubItemFormula(itm);
+        if (calc && calc.childNotFound) {
+            var msgNotFound = calc.childNotFoundMessage || ('Tidak ada unit (' + (calc.targetUnitLabel || 'bawahan') + ')');
+            swal('Perhatian', msgNotFound + '. Rumus tidak dapat diterapkan.', 'warning');
+            return;
+        }
+
+        var confirmText = 'Sistem akan menghitung ulang nilai butir (' + (itm.kode_sub_aspek || '') + ') dari variabel referensi dan menimpa nilai yang telah diisi manual.';
+
+        if (calc && calc.result !== null) {
+            confirmText += '\nHasil perhitungan rumus: ' + calc.result + (itm.satuan ? ' ' + itm.satuan : '') + '.';
+            if (calc.hasMissing) {
+                confirmText += '\n(Perhatian: Ada variabel yang belum terisi di data unit, diperhitungkan sebagai 0).';
+            }
+        }
+
+        var doRecalc = function () {
+            var btn = $('.btn-refresh-variabel-sub[data-id="' + idjawaban + '"], .btn-recalc-single[data-id="' + idjawaban + '"]');
+            btn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Menghitung...');
+
+            var statusLabel = $('#save-status-' + idjawaban);
+            statusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menghitung...');
+
+            $.ajax({
+                url: appBaseUrl + '/penugasan/rubrik_compile_otomatis',
+                type: 'POST',
+                data: {
+                    idpenugasan: idpenugasan,
+                    selected_ids: JSON.stringify([idjawaban])
+                },
+                dataType: 'json'
+            }).done(function (res) {
+                if (res && res.status) {
+                    var updated = (res.data && res.data.updated_item) ? res.data.updated_item : null;
+                    var valKuan = updated ? updated.nilai_hasil_hitung : (calc ? calc.result : null);
+                    var catatan = updated ? updated.catatan_otomatis : (res.message || 'Dihitung otomatis');
+
+                    if (updated && updated.child_unit_not_found) {
+                        $('#form-jawaban-' + idjawaban + ' input[name="nilai_kuantitatif"], #input-nilai-otomatis-' + idjawaban).val('');
+                        $('#form-jawaban-' + idjawaban + ' textarea[name="catatan_unit"]').val(catatan);
+                        itm.nilai_kuantitatif = null;
+                        itm.catatan_unit = catatan;
+                        itm.child_unit_not_found = true;
+                        itm.target_unit_label = updated.target_unit_label;
+                        itm.child_unit_message = updated.child_unit_message;
+                        if (updated.variabel_list && updated.variabel_list.length > 0) {
+                            itm.variabel_list = updated.variabel_list;
+                        }
+                        $('#sub-var-box-' + idjawaban).replaceWith(renderSubAspekVariabelBox(itm));
+                        statusLabel.html('<i class="fa fa-info-circle text-warning"></i> ' + htmlspecialchars(updated.child_unit_message || ('Tidak ada unit (' + updated.target_unit_label + ')')));
+                        swal('Perhatian', updated.child_unit_message ? updated.child_unit_message + '. Rumus tidak dapat diterapkan.' : ('Tidak ada unit (' + updated.target_unit_label + ').'), 'warning');
+                        return;
+                    }
+
+                    // 1. Update form input kuantitatif jika ada (input manual & otomatis sumber data)
+                    if (valKuan !== null && valKuan !== undefined) {
+                        var inputKuan = $('#form-jawaban-' + idjawaban + ' input[name="nilai_kuantitatif"], #input-nilai-otomatis-' + idjawaban);
+                        if (inputKuan.length) {
+                            inputKuan.val(parseFloat(valKuan));
+                            // Validasi target
+                            if (itm.operator_pembanding && itm.nilai_target_min) {
+                                $('#target-check-' + idjawaban).html(
+                                    checkTargetFulfilled(valKuan, itm.operator_pembanding, itm.nilai_target_min, itm.nilai_target_max)
+                                );
+                            }
+                        }
+                    }
+
+                    // 2. Update opsi skala jika tipe pilihan_skala dan ada opsi rekomendasi
+                    if (updated && updated.opsi_rekomendasi && updated.opsi_rekomendasi.id_opsi) {
+                        var optId = updated.opsi_rekomendasi.id_opsi;
+                        var group = $('#group-opsi-' + idjawaban);
+                        group.find('.opsi-radio-card').removeClass('selected');
+                        var radio = group.find('input[name="id_opsi_jawaban"][value="' + optId + '"]');
+                        radio.prop('checked', true);
+                        radio.closest('.opsi-radio-card').addClass('selected');
+                        itm.id_opsi_jawaban = optId;
+                    }
+
+                    // 3. Update catatan unit
+                    if (catatan) {
+                        $('#form-jawaban-' + idjawaban + ' textarea[name="catatan_unit"]').val(catatan);
+                        itm.catatan_unit = catatan;
+                    }
+
+                    // 4. Update data memori lokal (termasuk fresh variabel_list)
+                    if (valKuan !== null) {
+                        itm.nilai_kuantitatif = valKuan;
+                    }
+                    itm.is_terisi = 1;
+
+                    var freshVars = (updated && updated.variabel_list) ? updated.variabel_list : (res.data && res.data.sub_aspek_variabel ? res.data.sub_aspek_variabel[idjawaban] : null);
+                    if (freshVars && freshVars.length > 0) {
+                        itm.variabel_list = freshVars;
+                    }
+
+                    // Re-render sub-aspek variable box dengan nilai variabel yang fresh
+                    $('#sub-var-box-' + idjawaban).replaceWith(renderSubAspekVariabelBox(itm));
+
+                    // 5. Update status visual butir
+                    statusLabel.html('<i class="fa fa-check-circle text-success"></i> Dihitung Otomatis');
+                    var subRow = $('#box-item-' + idjawaban);
+                    subRow.removeClass('sub-wajib-belum sub-belum-diisi').addClass('sub-terisi');
+                    $('#sub-status-badge-' + idjawaban).replaceWith(subStatusHtml(idjawaban, true, false));
+
+                    // 6. Update status aspek & sidebar & progress bar
+                    updateAspekCardStatus(itm.id_aspek);
+                    updateSidebarIndikatorStatus(itm.id_indikator);
+                    updateProgressBar();
+
+                    var valFormatted = (valKuan !== null) ? (valKuan + (itm.satuan ? ' ' + itm.satuan : '')) : '';
+                    swal('Berhasil!', 'Nilai butir dan variabel berhasil dikalkulasi ulang ke isian ' + (valFormatted ? '(' + valFormatted + ')' : '') + '.', 'success');
+                } else {
+                    swal('Gagal', (res && res.message) ? res.message : 'Gagal melakukan kalkulasi ulang.', 'error');
+                }
+            }).fail(function () {
+                swal('Error', 'Terjadi kesalahan koneksi saat melakukan kalkulasi ulang.', 'error');
+            }).always(function () {
+                $('.btn-refresh-variabel-sub[data-id="' + idjawaban + '"], .btn-recalc-single[data-id="' + idjawaban + '"]')
+                    .prop('disabled', false)
+                    .html('<i class="fa fa-refresh"></i> Refresh Nilai');
+            });
+        };
+
+        if (skipConfirm) {
+            doRecalc();
+        } else {
+            if (typeof swal === 'function') {
+                swal({
+                    title: 'Kalkulasi Ulang Nilai Butir?',
+                    text: confirmText,
+                    icon: 'warning',
+                    buttons: ['Batal', 'Ya, Kalkulasi Ulang!'],
+                    dangerMode: false
+                }).then(function (willRecalc) {
+                    if (willRecalc) doRecalc();
+                });
+            } else {
+                if (confirm(confirmText)) doRecalc();
+            }
+        }
+    }
+
+    /**
+     * Merefresh nilai variabel pada sub-aspek tertentu dari server dan otomatis kalkulasi ulang jika ada rumus
+     */
+    function refreshSubAspekVariabel(idjawaban) {
+        var itm = null;
+        var itmIndex = -1;
+        $.each(rawJawabanList, function (idx, item) {
+            if (item.id_penugasan_jawaban == idjawaban) {
+                itm = item;
+                itmIndex = idx;
+                return false;
+            }
+        });
+
+        if (!itm) {
+            swal('Error', 'Data butir penilaian tidak ditemukan.', 'error');
+            return;
+        }
+
+        var btn = $('.btn-refresh-variabel-sub[data-id="' + idjawaban + '"]');
+        btn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Merefresh...');
+
+        $.ajax({
+            url: appBaseUrl + '/penugasan/rubrik_refresh_metrik_sub',
+            type: 'POST',
+            data: {
+                idpenugasan: idpenugasan,
+                id_penugasan_jawaban: idjawaban
+            },
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status && res.data) {
+                var freshVarList = res.data.variabel_list || [];
+
+                if (freshVarList && freshVarList.length > 0) {
+                    itm.variabel_list = freshVarList;
+                }
+
+                // Cek apakah data child unit tidak ditemukan
+                if (res.data.child_unit_not_found) {
+                    var targetMsg = res.data.child_unit_message || ('Tidak ada unit (' + (res.data.target_unit_label || 'bawahan') + ')');
+                    itm.child_unit_not_found = true;
+                    itm.target_unit_label = res.data.target_unit_label;
+                    itm.child_unit_message = targetMsg;
+                    itm.nilai_kuantitatif = null;
+                    itm.catatan_unit = targetMsg + '.';
+
+                    // Update tampilan form & catatan
+                    $('#form-jawaban-' + idjawaban + ' input[name="nilai_kuantitatif"], #input-nilai-otomatis-' + idjawaban).val('');
+                    $('#form-jawaban-' + idjawaban + ' textarea[name="catatan_unit"]').val(itm.catatan_unit);
+                    $('#target-check-' + idjawaban).html('<span class="label label-default fs-11 text-muted">Tidak Berlaku</span>');
+                    $('#sub-var-box-' + idjawaban).replaceWith(renderSubAspekVariabelBox(itm));
+                    $('#save-status-' + idjawaban).html('<i class="fa fa-info-circle text-warning"></i> ' + htmlspecialchars(targetMsg));
+
+                    // Terapkan ke backend agar catatan_unit tersimpan dan nilai_kuantitatif diset NULL
+                    $.ajax({
+                        url: appBaseUrl + '/penugasan/rubrik_compile_otomatis',
+                        type: 'POST',
+                        data: {
+                            idpenugasan: idpenugasan,
+                            selected_ids: JSON.stringify([idjawaban])
+                        },
+                        dataType: 'json'
+                    });
+
+                    swal({
+                        title: 'Perhatian',
+                        text: res.message || (targetMsg + ' yang ditemukan pada unit kerja ini.'),
+                        icon: 'warning'
+                    });
+                    btn.prop('disabled', false).html('<i class="fa fa-refresh"></i> Refresh Nilai');
+                    return;
+                }
+
+                // Update badge hasil hitung preview jika ada
+                if (res.data.nilai_hasil_hitung !== undefined && res.data.nilai_hasil_hitung !== null) {
+                    $('#calc-preview-badge-' + idjawaban).text(res.data.nilai_hasil_hitung + (itm.satuan ? ' ' + itm.satuan : ''));
+                }
+
+                // Cek apakah butir ini memiliki rumus atau hasil kalkulasi
+                var calcInfo = evaluateSubItemFormula(itm);
+                var hasFormula = !!(itm.rumus_kalkulasi && itm.rumus_kalkulasi.trim()) ||
+                                 (calcInfo && calcInfo.result !== null) ||
+                                 (res.data.nilai_hasil_hitung !== undefined && res.data.nilai_hasil_hitung !== null);
+
+                if (hasFormula) {
+                    // Otomatis langsung trigger kalkulasi ulang dan terapkan ke isian form tanpa perlu klik dua kali
+                    recalculateSingleItem(idjawaban, true);
+                } else {
+                    // Re-render sub-aspek variable box jika tidak ada rumus
+                    $('#sub-var-box-' + idjawaban).replaceWith(renderSubAspekVariabelBox(itm));
+                    swal({
+                        title: 'Metrik Diperbarui!',
+                        text: res.message || ('Nilai variabel butir (' + (itm.kode_sub_aspek || '') + ') berhasil ditarik ulang dari data tabel metrik.'),
+                        icon: 'success',
+                        timer: 2000,
+                        buttons: false
+                    });
+                    btn.prop('disabled', false).html('<i class="fa fa-refresh"></i> Refresh Nilai');
+                }
+            } else {
+                swal('Info', (res && res.message) ? res.message : 'Gagal merefresh nilai variabel dari tabel metrik.', 'info');
+                btn.prop('disabled', false).html('<i class="fa fa-refresh"></i> Refresh Nilai');
+            }
+        }).fail(function () {
+            swal('Error', 'Terjadi kesalahan koneksi saat merefresh nilai metrik.', 'error');
+            btn.prop('disabled', false).html('<i class="fa fa-refresh"></i> Refresh Nilai');
+        });
+    }
+
+})(jQuery);

@@ -1,0 +1,111 @@
+/* 
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+$(function(){
+    
+    initSelect2IdUnit= function(element, modal='') {
+        var mparent='';
+        if(modal) mparent=modal;
+        element.select2({
+            ajax: {
+                url: appBaseUrl + "/master/find_unit",
+                data: function (params) {
+                    return {
+                        unit: params.term                       
+                    }
+                },
+                processResults: function (data, params) {
+                    if (data) {
+                        for(var i=0; i<data.length; i++){                     
+                            var parent_unit='';
+                            if (data[i].parent_unit) parent_unit = data[i].parent_unit;
+                            data[i].id = data[i].id_unit;
+                            data[i].text = data[i].kode_unit +': '+data[i].unit.toUpperCase();
+                            data[i].html = '<div class="text-uppercase"><b>'+data[i].unit +'</b><br>'+parent_unit+'</div>';
+                        }
+                    }
+                    return {
+                        results: data
+                    }
+                }
+            },
+            dropdownParent:mparent,
+            placeholder: "Pilih Unit Kerja",
+            width: "100%",
+            minimumInputLength: 1,
+            allowClear:true,
+            escapeMarkup: function(markup) {
+                return markup;
+            },
+            templateResult: function(data) {
+                return data.html;
+            },
+            templateSelection: function(data) {
+                return data.text;
+            }
+        });
+    };
+    
+    initSelect2Pegawai = function(element, modal='') {        
+        var mparent='';
+        if(modal) mparent=modal;
+        element.select2({
+            ajax: {
+                url: appBaseUrl + "/master/find_pegawai",
+                data: function (params) {
+                    return {
+                        pegawai: params.term,                        
+                        nomor_identitas:params.term
+                    }
+                },
+                processResults: function (data, params) {
+                   if (data) { 
+                    for(var i=0; i<data.length; i++){
+                        u = data[i];
+                        if(data[i].unit_homebase!=null){
+                            if(data[i].unit_homebase==data[i].unit_satker) var unit = data[i].unit_homebase.toUpperCase();
+                            else var unit = data[i].unit_homebase.toUpperCase() +' - '+ data[i].unit_satker.toUpperCase();
+                        }
+                        else var unit='';
+
+                        if(u.status_kontrak!=null && u.id_status_pegawai == '2') var status_kontrak = '<br><small><i><b>STATUS KONTRAK:</b> '+u.status_kontrak+'</i></small>';
+                        else var status_kontrak='';
+
+                        u.pegawai = (u.gelar_prof==null?'':u.gelar_prof + ' ') +(u.gelar_depan==null?'':u.gelar_depan + ' ') + u.pegawai+(u.gelar_belakang==null?'':', '+u.gelar_belakang);
+                        var jabatan = u.jabatan_fungsional;
+                        if (u.jabatan_struktural) jabatan = u.jabatan_struktural;
+                        data[i].id = data[i].idpegawai;
+                        data[i].text = u.pegawai;
+                        data[i].html = '<div class="text-uppercase"><span class="text-black text-bold">'+u.pegawai +'</span>' +
+                            '<br><b>'+data[i].tag_identitas+'.</b> '+data[i].nomor_identitas+', <b>UNIT KERJA:</b> '+unit
+                            +'<br>Jabatan: '+jabatan+'</div>';                        
+                    }
+                }
+                    return {
+                        results: data
+                    }
+                }
+            },
+            dropdownParent:mparent,
+            escapeMarkup: function (markup) { return markup; },
+            placeholder: "Pilih Pegawai",
+
+            width: "100%",
+            minimumInputLength: 3,
+            allowClear:true,
+            escapeMarkup: function(markup) {
+                return markup;
+            },
+            templateResult: function(data) {
+                return data.html;
+            },
+            templateSelection: function(data) {
+                return data.text;
+            }
+        });
+    };
+    
+   }); 

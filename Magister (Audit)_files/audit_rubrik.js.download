@@ -1,0 +1,1476 @@
+/**
+ * JavaScript Controller: Modul Audit Rubrik Penilaian oleh Auditor
+ * Fitur:
+ * - Meninjau isian unit auditee (Tipe 1: Sumber Data, Tipe 2: Dokumen, Tipe 3: Data Manual)
+ * - Memberikan penilaian pemenuhan (Memenuhi / Tidak Memenuhi) dan skor audit
+ * - Memberikan catatan rekomendasi / temuan audit per butir
+ * - Buka kunci form auditee untuk revisi / perbaikan data
+ * - Statistik capaian dan progress audit interaktif
+ */
+
+(function ($) {
+    'use strict';
+
+    var idpenugasan = $('#audit-rubrik-root').data('idpenugasan');
+    var isAuditActive = ($('#audit-rubrik-root').data('is-audit-active') == '1');
+    var rawJawabanList = [];
+    var kriteriaList = [];
+    var currentFilterKriteria = '';
+    var currentFilterStatus = 'all'; // all, belum, memenuhi, tidak
+    var currentSearch = '';
+    var saveDebounceTimers = {};
+    var isProgrammaticScroll = false;
+    var scrollSpyTimer = null;
+    var currentActiveIndikatorId = null;
+
+    function htmlspecialchars(str) {
+        if (!str) return '';
+        return $('<div>').text(str).html();
+    }
+
+    function nl2br(str) {
+        if (!str) return '';
+        return str.replace(/(?:\r\n|\r|\n)/g, '<br>');
+    }
+
+    $(document).ready(function () {
+        if (typeof $.Loading !== 'undefined' && $.Loading.defaults) {
+            $.Loading.defaults.zIndex = 105000;
+        }
+
+        if (!idpenugasan) {
+            console.error("ID Penugasan tidak ditemukan!");
+            return;
+        }
+
+        initEvents();
+        loadAuditRubrikData();
+    });
+
+    function initEvents() {
+        // Filter Status Audit
+        $('#filter-status-audit').on('change', function () {
+            currentFilterStatus = $(this).val();
+            renderAuditItems();
+        });
+
+        // Search Input Konten Tengah
+        $('#input-search-rubrik').on('keyup', function () {
+            currentSearch = $(this).val().toLowerCase().trim();
+            renderAuditItems();
+        });
+
+        // Searchbox Sidebar Navigasi Indikator
+        $('#search-sidebar-indikator').on('input keyup', function () {
+            filterSidebarIndikator();
+        });
+        $('#search-sidebar-indikator').on('keydown', function (e) {
+            if (e.keyCode === 27) {
+                $(this).val('').trigger('input');
+            }
+        });
+        $('#btn-clear-sidebar-search').on('click', function () {
+            $('#search-sidebar-indikator').val('').trigger('input').focus();
+        });
+
+        // Tombol Buka Kunci Revisi untuk Auditee
+        $('.btn-unlock-auditee').on('click', function () {
+            unlockAuditeeForRevision();
+        });
+
+        // Tombol Selesaikan Audit
+        $('.btn-finalize-audit').on('click', function () {
+            finalizeAudit();
+        });
+
+        // Klik subopsi card penilaian auditor (Acceptable, Concern, Weakness, Defisiensi) -> Auto-Save langsung
+        $(document).on('click', '.subopsi-card', function () {
+            if (!isAuditActive) {
+                swal('Perhatian', 'Jadwal penilaian auditor sedang tidak aktif (belum aktif atau batas waktu/deadline telah berakhir).', 'warning');
+                return;
+            }
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+            var valParent = $(this).data('val-parent');
+            var valSub = $(this).data('val-sub');
+            var defaultSkor = $(this).data('default-skor');
+
+            form.find('.subopsi-card').removeClass('selected-acceptable selected-concern selected-weakness selected-defisiensi');
+            form.find('.subopsi-icon i').removeClass('fa-check-circle').addClass('fa-circle-o');
+
+            $(this).addClass('selected-' + String(valSub).toLowerCase());
+            $(this).find('.subopsi-icon i').removeClass('fa-circle-o').addClass('fa-check-circle');
+
+            form.find('[name="status_pemenuhan"]').val(valParent);
+            form.find('[name="sub_status_pemenuhan"]').val(valSub);
+
+            // Set default skor otomatis sesuai subopsi
+            form.find('.audit-skor-input').val(defaultSkor);
+
+            // Trigger auto-save instan saat opsi evaluasi dipilih
+            saveAuditItem(idjawaban, false);
+        });
+
+        // Input angka skor review realtime debounce auto-save
+        $(document).on('input change', '.audit-skor-input', function () {
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+            debounceSaveAudit(idjawaban);
+        });
+
+        // Textarea catatan review realtime debounce auto-save
+        $(document).on('input', '.audit-catatan', function () {
+            var form = $(this).closest('form');
+            var idjawaban = form.data('id');
+            debounceSaveAudit(idjawaban);
+        });
+
+        // Tombol Simpan Penilaian Audit Manual (Feedback Swal Modal)
+        $(document).on('click', '.btn-save-audit', function () {
+            if (!isAuditActive) {
+                swal('Perhatian', 'Jadwal penilaian auditor sedang tidak aktif (belum aktif atau batas waktu/deadline telah berakhir).', 'warning');
+                return;
+            }
+            var idjawaban = $(this).data('id');
+            saveAuditItem(idjawaban, true);
+        });
+
+        // Window scroll & resize event untuk sinkronisasi scroll item sidebar indikator (ScrollSpy)
+        $(window).off('scroll.sidebarScrollSpy resize.sidebarScrollSpy');
+        $(window).on('scroll.sidebarScrollSpy', function () {
+            if (isProgrammaticScroll) return;
+            if (scrollSpyTimer) return;
+            scrollSpyTimer = requestAnimationFrame(function () {
+                scrollSpyTimer = null;
+                syncSidebarOnScroll();
+            });
+        });
+        $(window).on('resize.sidebarScrollSpy', function () {
+            if (isProgrammaticScroll) return;
+            syncSidebarOnScroll();
+        });
+    }
+
+    /**
+     * Memuat data jawaban rubrik untuk diaudit
+     */
+    function loadAuditRubrikData() {
+        $('body').loading('start');
+        var url = appBaseUrl + '/penugasan/rubrik_find_jawaban';
+
+        $.ajax({
+            url: url,
+            type: 'POST',
+            data: { idpenugasan: idpenugasan },
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status && res.data) {
+                rawJawabanList = res.data;
+                extractKriteriaList();
+                renderKriteriaPills();
+                renderAuditItems();
+                updateAuditProgressBar();
+            } else {
+                $('#audit-items-container').html(
+                    '<div class="alert alert-warning text-center">' +
+                    '<i class="fa fa-exclamation-triangle"></i> ' +
+                    (res && res.message ? res.message : 'Belum ada data butir rubrik untuk penugasan ini.') +
+                    '</div>'
+                );
+            }
+        }).fail(function () {
+            swal('Error', 'Gagal memuat instrumen rubrik penilaian.', 'error');
+        }).always(function () {
+            $('body').loading('stop');
+        });
+    }
+
+    function extractKriteriaList() {
+        var map = {};
+        kriteriaList = [];
+
+        $.each(rawJawabanList, function (i, item) {
+            if (item.id_kriteria && !map[item.id_kriteria]) {
+                map[item.id_kriteria] = true;
+                kriteriaList.push({
+                    id_kriteria: item.id_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    nama_kriteria: item.nama_kriteria,
+                    urutan: item.kriteria_urutan || i
+                });
+            }
+        });
+
+        kriteriaList.sort(function (a, b) {
+            return (a.urutan || 0) - (b.urutan || 0);
+        });
+    }
+
+    function renderKriteriaPills() {
+        var html = '<button type="button" class="btn btn-primary btn-sm filter-pill-btn ' + (currentFilterKriteria === '' ? 'active' : '') + '" data-idkriteria="">Semua Kriteria</button>';
+
+        $.each(kriteriaList, function (i, k) {
+            var isActive = (currentFilterKriteria == k.id_kriteria) ? 'active btn-primary' : 'btn-default';
+            html += '<button type="button" class="btn btn-sm filter-pill-btn ' + isActive + '" data-idkriteria="' + k.id_kriteria + '">' +
+                htmlspecialchars(k.nama_kriteria || k.kode_kriteria) +
+                '</button>';
+        });
+
+        $('#filter-kriteria-pills').html(html);
+
+        $('#filter-kriteria-pills .filter-pill-btn').on('click', function () {
+            $('#filter-kriteria-pills .filter-pill-btn').removeClass('active btn-primary').addClass('btn-default');
+            $(this).addClass('active btn-primary').removeClass('btn-default');
+            currentFilterKriteria = $(this).data('idkriteria');
+            renderAuditItems();
+        });
+    }
+
+    /**
+     * Deteksi apakah butir penilaian mengacu pada unit anak yang tidak ada
+     */
+    function checkChildUnitNotFound(sub) {
+        if (!sub) return { isNotFound: false, targetLabel: null, message: null };
+        var isNotFound = !!sub.child_unit_not_found;
+        var targetLabel = sub.target_unit_label || null;
+        var message = sub.child_unit_message || null;
+
+        if (!isNotFound && sub.variabel_list && sub.variabel_list.length > 0) {
+            $.each(sub.variabel_list, function (_, v) {
+                if (v.child_unit_not_found || (v.agregasi_info && v.agregasi_info.indexOf('Tidak ada unit') !== -1)) {
+                    isNotFound = true;
+                    if (!targetLabel && v.target_unit_label) targetLabel = v.target_unit_label;
+                    if (!message && v.agregasi_info) message = v.agregasi_info;
+                    return false;
+                }
+            });
+        }
+
+        if (isNotFound && !message) {
+            message = 'Tidak ada unit (' + (targetLabel || 'bawahan') + ')';
+        }
+
+        return {
+            isNotFound: isNotFound,
+            targetLabel: targetLabel,
+            message: message
+        };
+    }
+
+    function filterAuditItems() {
+        return $.grep(rawJawabanList, function (item) {
+            if (currentFilterKriteria && item.id_kriteria != currentFilterKriteria) {
+                return false;
+            }
+
+            var subStatus = item.sub_status_pemenuhan || '';
+            var hasReviewed = (item.status_pemenuhan === 'Memenuhi' || item.status_pemenuhan === 'Tidak Memenuhi' || subStatus !== '');
+
+            if (currentFilterStatus === 'belum' && hasReviewed) {
+                return false;
+            }
+            if (currentFilterStatus === 'memenuhi' && item.status_pemenuhan !== 'Memenuhi' && subStatus !== 'Acceptable' && subStatus !== 'Concern') {
+                return false;
+            }
+            if (currentFilterStatus === 'tidak' && item.status_pemenuhan !== 'Tidak Memenuhi' && subStatus !== 'Weakness' && subStatus !== 'Defisiensi') {
+                return false;
+            }
+            if (currentFilterStatus === 'Acceptable' && subStatus !== 'Acceptable') {
+                return false;
+            }
+            if (currentFilterStatus === 'Concern' && subStatus !== 'Concern') {
+                return false;
+            }
+            if (currentFilterStatus === 'Weakness' && subStatus !== 'Weakness') {
+                return false;
+            }
+            if (currentFilterStatus === 'Defisiensi' && subStatus !== 'Defisiensi') {
+                return false;
+            }
+
+            if (currentSearch) {
+                var haystack = (
+                    (item.kode_aspek || '') + ' ' +
+                    (item.kode_sub_aspek || '') + ' ' +
+                    (item.deskripsi_aspek || '') + ' ' +
+                    (item.pernyataan_sub_aspek || '') + ' ' +
+                    (item.sub_status_pemenuhan || '') + ' ' +
+                    (item.catatan_unit || '') + ' ' +
+                    (item.catatan_review || '') + ' ' +
+                    (item.child_unit_message || '') + ' ' +
+                    (item.target_unit_label || '')
+                ).toLowerCase();
+
+                if (haystack.indexOf(currentSearch) === -1) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+    }
+
+    /**
+    // Tampilan skor angka disembunyikan sementara. Ubah ke true untuk menampilkannya lagi; penghitungan & penyimpanan skor tidak terpengaruh. */
+    var SHOW_SKOR = false;
+    /**
+     * Hasil penilaian per butir sebagai teks sederhana (tanpa skor angka & lencana warna-warni)
+     */
+    function evalBadgeHtml(id, subStatus, statusPemenuhan) {
+        var cls = 'status-muted', icon = '', text = 'Belum dinilai';
+        if (subStatus === 'Acceptable')      { cls = 'status-ok';   icon = 'fa-check-circle';  text = 'Acceptable'; }
+        else if (subStatus === 'Concern')    { cls = 'status-warn'; icon = 'fa-info-circle';   text = 'Concern'; }
+        else if (subStatus === 'Weakness')   { cls = 'status-bad';  icon = 'fa-exclamation-circle'; text = 'Weakness'; }
+        else if (subStatus === 'Defisiensi') { cls = 'status-bad';  icon = 'fa-times-circle';  text = 'Defisiensi'; }
+        else if (statusPemenuhan === 'Memenuhi')       { cls = 'status-ok';  icon = 'fa-check-circle'; text = 'Memenuhi'; }
+        else if (statusPemenuhan === 'Tidak Memenuhi') { cls = 'status-bad'; icon = 'fa-times-circle'; text = 'Tidak memenuhi'; }
+        return '<span class="status-text ' + cls + '" id="badge-eval-' + id + '">' + (icon ? '<i class="fa ' + icon + '"></i> ' : '') + text + '</span>';
+    }
+
+    function auditAspekStatusHtml(done, total) {
+        if (total > 0 && done >= total) {
+            return '<span class="status-text status-ok"><i class="fa fa-check-circle"></i> Selesai dinilai (' + done + ' dari ' + total + ')</span>';
+        }
+        return '<span class="status-text status-muted">' + done + ' dari ' + total + ' dinilai</span>';
+    }
+
+    function renderAuditItems() {
+        var filteredItems = filterAuditItems();
+
+        renderKolomKiriIndikator(filteredItems);
+
+        if (!filteredItems || filteredItems.length === 0) {
+            $('#audit-items-container').html(
+                '<div class="well bg-white text-center" style="padding: 40px 20px;">' +
+                '<i class="fa fa-info-circle text-muted"></i> ' +
+                '<span class="text-slate-500 font-semibold margin-top-10">Tidak ada butir rubrik yang cocok dengan filter.</span>' +
+                '</div>'
+            );
+            return;
+        }
+
+        var groupedAspek = [];
+        var aspekMap = {};
+
+        $.each(filteredItems, function (idx, item) {
+            var aId = item.id_aspek;
+            if (!aspekMap[aId]) {
+                aspekMap[aId] = {
+                    id_aspek: aId,
+                    kode_aspek: item.kode_aspek,
+                    label_aspek: item.label_aspek,
+                    deskripsi_aspek: item.deskripsi_aspek,
+                    sumber_data: item.sumber_data,
+                    deskripsi_pemenuhan: item.deskripsi_pemenuhan,
+                    id_indikator: item.id_indikator,
+                    nomor_indikator: item.nomor_indikator,
+                    pernyataan_indikator: item.pernyataan_indikator,
+                    justifikasi: item.justifikasi,
+                    id_sasaran_mutu: item.id_sasaran_mutu,
+                    nama_sasaran: item.nama_sasaran,
+                    kode_sasaran: item.kode_sasaran,
+                    is_syarat_unggul_indikator: item.is_syarat_unggul_indikator,
+                    is_syarat_unggul_aspek: item.is_syarat_unggul_aspek,
+                    nama_kriteria: item.nama_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    sub_items: []
+                };
+                groupedAspek.push(aspekMap[aId]);
+            }
+            aspekMap[aId].sub_items.push(item);
+        });
+
+        var html = '';
+        var lastIndikatorId = null;
+
+        $.each(groupedAspek, function (aIdx, aspek) {
+            // Tampilkan Header Pembatas Indikator Baru saat berpindah indikator (Persis Penilaian Mandiri)
+            if (aspek.id_indikator !== lastIndikatorId) {
+                lastIndikatorId = aspek.id_indikator;
+                var isSyaratUnggulInd = (parseInt(aspek.is_syarat_unggul_indikator) === 1);
+                var marginClass = (aIdx > 0) ? 'margin-top-35' : 'margin-top-5';
+
+                html += '<div class="indikator-section-header indikator-header-box ' + marginClass + '" id="indikator-section-' + aspek.id_indikator + '" data-idindikator="' + aspek.id_indikator + '">';
+                html += '<div>';
+                html += '<div class="indikator-header-top">';
+                html += '<div class="indikator-badge-group">';
+                html += '<span class="label label-primary fs-11 pad-3-8 text-bold"><i class="fa fa-folder-open"></i> ' + htmlspecialchars(aspek.nama_kriteria || aspek.kode_kriteria) + '</span>';
+                if (aspek.nama_sasaran) {
+                    html += '<span class="label label-default fs-11 border-dashed-white-25 pad-3-8"><i class="fa fa-crosshairs"></i> ' + htmlspecialchars(aspek.nama_sasaran) + '</span>';
+                }
+                if (isSyaratUnggulInd) {
+                    html += '<span class="label label-warning fs-11 pad-3-8 text-bold" title="Syarat Perlu"><i class="fa fa-check-circle"></i> Syarat Perlu</span>';
+                }
+                html += '</div>';
+                html += '</div>';
+
+                html += '<div class="indikator-title-text">';
+                html += '<span class="margin-r-5">Indikator ' + htmlspecialchars(aspek.nomor_indikator) + ':</span> ';
+                html += nl2br(htmlspecialchars(aspek.pernyataan_indikator));
+                html += '</div>';
+
+                if (aspek.justifikasi) {
+                    html += '<div class="indikator-desc-text"><i class="fa fa-bookmark"></i> <b>Rujukan / Regulasi:</b> ' + htmlspecialchars(aspek.justifikasi) + '</div>';
+                }
+
+                html += '</div></div>';
+            }
+
+            // Hitung status kelengkapan evaluasi aspek dari rawJawabanList
+            var totalSubInAspek = 0;
+            var auditedSubInAspek = 0;
+            var isAspekSyaratUnggul = (parseInt(aspek.is_syarat_unggul_aspek) === 1 || parseInt(aspek.is_syarat_unggul_indikator) === 1);
+
+            $.each(rawJawabanList, function (rIdx, rItem) {
+                if (rItem.id_aspek == aspek.id_aspek) {
+                    totalSubInAspek++;
+                    var isEvaluated = (rItem.status_pemenuhan === 'Memenuhi' || rItem.status_pemenuhan === 'Tidak Memenuhi' || (rItem.sub_status_pemenuhan && rItem.sub_status_pemenuhan !== ''));
+                    if (isEvaluated) {
+                        auditedSubInAspek++;
+                    }
+                }
+            });
+
+            var isAllAudited = (totalSubInAspek > 0 && auditedSubInAspek >= totalSubInAspek);
+            var statusBoxClass = isAllAudited ? 'status-sudah-diisi' : 'status-belum-diisi';
+
+            var headerStatusBadge = auditAspekStatusHtml(auditedSubInAspek, totalSubInAspek);
+
+            // Ambil judul aspek ringkas untuk sticky header
+            var aspekTitle = aspek.label_aspek;
+            if (!aspekTitle && aspek.deskripsi_aspek) {
+                var firstLine = aspek.deskripsi_aspek.split(/\r?\n/)[0].trim();
+                aspekTitle = firstLine;
+            }
+
+            // 1 CARD PER ASPEK (Persis Penilaian Mandiri)
+            html += '<div class="rubrik-item-box aspek-card ' + statusBoxClass + '" id="aspek-card-' + aspek.id_aspek + '" data-idaspek="' + aspek.id_aspek + '" data-idindikator="' + aspek.id_indikator + '">';
+
+            // STICKY HEADER ASPEK (Menampilkan Kode, Judul Aspek, Badges, dan Status)
+            html += '<div class="rubrik-item-header">' +
+                '<div class="aspek-header-flex">' +
+                '<span class="aspek-badge bg-blue font-bold aspek-badge-title">' + htmlspecialchars(aspek.kode_aspek) + '</span> ' +
+                (aspekTitle ? '<span class="aspek-sticky-title" title="' + htmlspecialchars(aspekTitle) + '">' + htmlspecialchars(aspekTitle) + '</span>' : '') +
+                (isAspekSyaratUnggul ? '<span class="status-text status-muted margin-l-5" title="Syarat Perlu">Syarat perlu</span> ' : '') +
+                '</div>' +
+                '<div class="aspek-header-status flex-shrink-0" id="aspek-status-header-' + aspek.id_aspek + '">' +
+                headerStatusBadge +
+                '</div>' +
+                '</div>';
+
+            // Overview Panel Aspek (Deskripsi Aspek, Sumber Data, Kriteria Pemenuhan)
+            html += '<div class="aspek-overview-panel">' +
+                '<div class="aspek-overview-text">' + nl2br(htmlspecialchars(aspek.deskripsi_aspek)) + '</div>';
+
+            // Kriteria pemenuhan penting bagi auditor, jadi tetap mudah dibuka; sumber data ikut dilipat
+            if (aspek.sumber_data || aspek.deskripsi_pemenuhan) {
+                html += '<details class="rincian-toggle"' + (aspek.deskripsi_pemenuhan ? ' open' : '') + '><summary>Kriteria pemenuhan dan sumber data</summary><div class="rincian-body">';
+                if (aspek.deskripsi_pemenuhan) {
+                    html += '<div class="meta-row"><b>Kriteria pemenuhan:</b> ' + htmlspecialchars(aspek.deskripsi_pemenuhan) + '</div>';
+                }
+                if (aspek.sumber_data) {
+                    html += '<div class="meta-row"><b>Sumber data:</b> ' + htmlspecialchars(aspek.sumber_data) + '</div>';
+                }
+                html += '</div></details>';
+            }
+
+            html += '</div>'; // End aspek-overview-panel
+
+            html += '<div class="sub-aspek-container">';
+
+            $.each(aspek.sub_items, function (sIdx, sub) {
+                var id = sub.id_penugasan_jawaban;
+                var subStatus = sub.sub_status_pemenuhan || '';
+                var statusBadge = evalBadgeHtml(id, subStatus, sub.status_pemenuhan);
+
+                var childCheck = checkChildUnitNotFound(sub);
+                var isChildNotFound = childCheck.isNotFound;
+                var missingMsg = childCheck.message;
+
+                html += '<div class="sub-aspek-row' + (isChildNotFound ? ' warning-row' : '') + '" id="sub-row-' + id + '">';
+                
+                // Header sub-aspek
+                html += '<div class="sub-aspek-row-header' + (isChildNotFound ? ' bg-warning-light' : '') + '">' +
+                    '<div>' +
+                    '<span class="aspek-badge font-bold margin-r-5">Butir ' + htmlspecialchars(sub.kode_sub_aspek) + '</span> ' +
+                    (parseInt(sub.is_mandatory) === 1 ? '<span class="status-text status-muted margin-r-5">Wajib</span>' : '') +
+                    (isChildNotFound ? '<span class="status-text status-warn margin-l-5" title="' + htmlspecialchars(missingMsg) + '"><i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(missingMsg) + '</span>' : '') +
+                    '</div>' +
+                    '<div>' + statusBadge + '</div>' +
+                    '</div>';
+
+                html += '<div class="row row-flex-wrap">';
+
+                // Kolom Kiri Sub (Pernyataan & Isian Auditee)
+                html += '<div class="col-sm-6 aspek-content-panel">';
+                html += '<div class="sub-pernyataan-box">' +
+                    '<div class="fs-13 text-navy text-semibold line-height-150">' +
+                    nl2br(htmlspecialchars(sub.pernyataan_sub_aspek)) +
+                    '</div>' +
+                    '</div>';
+
+                // Tampilan Isian Unit Auditee
+                html += renderIsianAuditeeReview(sub);
+
+                html += '</div>'; // End Kolom Kiri Sub
+
+                // Kolom Kanan Sub (Panel Evaluasi Auditor)
+                html += '<div class="col-sm-6 audit-eval-panel">';
+                html += renderPanelEvaluasiAuditor(sub);
+                html += '</div>'; // End Kolom Kanan Sub
+
+                html += '</div>'; // End row flex
+                html += '</div>'; // End sub-aspek-row
+            });
+
+            html += '</div>'; // End sub-aspek-container
+            html += '</div>'; // End rubrik-item-box (aspek-card)
+        });
+
+        $('#audit-items-container').html(html);
+    }
+
+    function formatTipeJawaban(tipe) {
+        if (tipe === 'sumber_data') return 'Isian dari Sumber Data';
+        if (tipe === 'dokumen') return 'Isian Dokumen';
+        if (tipe === 'data_manual') return 'Isian Data Manual';
+        return tipe || 'Standar';
+    }
+
+    /**
+     * Render Tampilan Isian & Bukti yang Diisi oleh Unit Auditee
+     */
+    function renderIsianAuditeeReview(sub) {
+        var childCheck = checkChildUnitNotFound(sub);
+        var isChildNotFound = childCheck.isNotFound;
+        var missingMsg = childCheck.message;
+
+        var h = '<div class="auditee-answer-box' + (isChildNotFound ? ' bg-warning-light' : '') + '" style="padding: 14px 16px; border-radius: 6px;">';
+        h += '<div class="margin-bottom-10" style="font-size: 16px; font-weight: 600; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px;">' +
+            'Jawaban unit' +
+            (isChildNotFound ? ' <span class="status-text status-warn margin-l-5"><i class="fa fa-exclamation-triangle"></i> Unit bawahan tidak ada</span>' : '') +
+            '</div>';
+
+        if (isChildNotFound) {
+            h += '<div class="alert alert-warning" style="background-color: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #f59e0b; color: #92400e; padding: 8px 12px; margin-bottom: 12px; border-radius: 4px; font-size: 12px; line-height: 1.4;">' +
+                '<i class="fa fa-exclamation-triangle margin-r-5 text-warning"></i> <b>Informasi Rumus Unit Bawahan:</b> Butir ini mengacu pada agregasi variabel unit bawahan, namun <b>' + htmlspecialchars(missingMsg) + '</b> pada unit kerja auditee ini.' +
+                '</div>';
+        }
+
+        var tipe = sub.tipe_jawaban || 'sumber_data';
+
+        if (tipe === 'sumber_data') {
+            if (isChildNotFound) {
+                h += '<div class="margin-bottom-8" style="font-size: 13.5px; color: #1e293b;">' +
+                    '<b>Nilai hasil hitung:</b> ' +
+                    '<span class="badge bg-gray font-monospace" style="font-size: 14px; padding: 4px 10px; color: #64748b;">-</span> ' +
+                    '<span class="label label-warning fs-11 margin-l-5" title="' + htmlspecialchars(missingMsg) + '"><i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(missingMsg) + '</span>' +
+                    '</div>';
+            } else {
+                var valK = (sub.nilai_kuantitatif !== null && sub.nilai_kuantitatif !== undefined && sub.nilai_kuantitatif !== '') ? parseFloat(sub.nilai_kuantitatif) : '-';
+                h += '<div class="margin-bottom-8" style="font-size: 13.5px; color: #1e293b;">' +
+                    '<b>Nilai hasil hitung:</b> ' +
+                    '<span class="badge bg-navy font-monospace" style="font-size: 14px; padding: 4px 10px;">' + valK + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') + '</span>' +
+                    '</div>';
+            }
+
+            if (sub.rumus_kalkulasi) {
+                h += '<div class="margin-bottom-6" style="font-size: 13px; color: #334155;"><b>Rumus:</b> <code style="font-size: 13px;">' + htmlspecialchars(sub.rumus_kalkulasi) + '</code></div>';
+            }
+
+            if (sub.operator_pembanding && sub.nilai_target_min) {
+                if (isChildNotFound) {
+                    h += '<div style="font-size: 13px; color: #334155;"><b>Target:</b> ' +
+                        '<span class="label label-default fs-11 text-muted margin-r-5">Tidak Berlaku</span>' +
+                        '<small class="text-muted">(Standar: ' + htmlspecialchars(sub.operator_pembanding) + ' ' + parseFloat(sub.nilai_target_min) + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') + ')</small>' +
+                        '</div>';
+                } else {
+                    h += '<div style="font-size: 13px; color: #334155;"><b>Target:</b> ' + htmlspecialchars(sub.operator_pembanding) + ' ' + parseFloat(sub.nilai_target_min) + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') + '</div>';
+                }
+            }
+        } else if (tipe === 'dokumen') {
+            h += '<div class="margin-bottom-8 text-info" style="font-size: 13.5px; font-weight: 600;"><i class="fa fa-file-text-o"></i> Butir Evaluasi Berbasis Dokumen Bukti Pemenuhan.</div>';
+        } else if (tipe === 'data_manual') {
+            var valM = (sub.nilai_kuantitatif !== null && sub.nilai_kuantitatif !== undefined && sub.nilai_kuantitatif !== '') ? parseFloat(sub.nilai_kuantitatif) : '-';
+            h += '<div class="margin-bottom-8" style="font-size: 13.5px; color: #1e293b;">' +
+                '<b>Capaian yang dilaporkan unit:</b> ' +
+                '<span class="badge bg-blue font-monospace" style="font-size: 14px; padding: 4px 10px;">' + valM + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') + '</span>' +
+                '</div>';
+            if (sub.operator_pembanding && sub.nilai_target_min) {
+                h += '<div style="font-size: 13px; color: #334155;"><b>Target:</b> ' + htmlspecialchars(sub.operator_pembanding) + ' ' + parseFloat(sub.nilai_target_min) + ' ' + (sub.satuan ? htmlspecialchars(sub.satuan) : '') + '</div>';
+            }
+        }
+
+        // Variabel Pendukung Terlampir (jika ada data variabel_list)
+        if (sub.variabel_list && sub.variabel_list.length > 0) {
+            h += '<details class="rincian-toggle"><summary>Lihat data pendukung (' + sub.variabel_list.length + ' variabel)</summary>' + renderVariabelBoxReview(sub, isChildNotFound, missingMsg) + '</details>';
+        }
+
+        // Catatan Pemenuhan Unit (Deskripsi)
+        if (sub.catatan_unit) {
+            h += '<div class="margin-top-10" style="background: #ffffff; padding: 10px 12px; border-radius: 6px; border: 1px dashed #bae6fd; line-height: 1.5;">' +
+                '<b style="color: #0369a1; font-size: 13.5px;">Keterangan unit:</b> <div style="margin-top: 4px; color: #1e293b; font-size: 13px; font-weight: 500;">' + nl2br(htmlspecialchars(sub.catatan_unit)) + '</div>' +
+                '</div>';
+        }
+
+        // Bukti Dukung yang Diunggah
+        h += '<div class="margin-top-10">';
+        h += '<b style="font-size: 13.5px; color: #334155;"><i class="fa fa-paperclip"></i> Bukti dukung:</b><br>';
+        if (sub.bukti_dukung && sub.bukti_dukung.length > 0) {
+            $.each(sub.bukti_dukung, function (_, bukti) {
+                var fileUrl = bukti.tipe_bukti === 'url'
+                    ? (bukti.url_eksternal || '#')
+                    : (bukti.file_url || (bukti.file_path ? (appBaseUrl + '/' + bukti.file_path) : '#'));
+                var icon = (bukti.tipe_bukti === 'url') ? 'fa-external-link text-primary' : 'fa-file-pdf-o text-danger';
+
+                h += '<a href="' + fileUrl + '" target="_blank" class="bukti-item-pill" style="font-size: 12.5px; padding: 5px 12px; margin-top: 5px;" title="Buka Dokumen">' +
+                    '<i class="fa ' + icon + '"></i> ' + htmlspecialchars(bukti.nama_dokumen || 'Dokumen Bukti') +
+                    '</a> ';
+            });
+        } else {
+            h += '<small class="text-muted font-italic" style="font-size: 12px;">Unit tidak melampirkan bukti dukung.</small>';
+        }
+        h += '</div>';
+
+        h += '</div>'; // End auditee-answer-box
+        return h;
+    }
+
+    /**
+     * Render Tabel Variabel Pendukung untuk Review Auditor
+     */
+    function renderVariabelBoxReview(sub, isChildNotFound, missingMsg) {
+        if (!sub || !sub.variabel_list || sub.variabel_list.length === 0) return '';
+
+        var h = '<div class="sub-var-box" style="margin-top: 10px; background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px;">' +
+            '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">' +
+            '<span style="font-size: 14px; font-weight: 600; color: #334155;">Data pendukung</span>' +
+            '<span class="badge bg-navy" style="font-size: 10px;">' + sub.variabel_list.length + ' Variabel</span>' +
+            '</div>' +
+            '<div class="table-responsive no-margin">' +
+            '<table class="table table-bordered table-condensed bg-white no-margin" style="font-size: 11px;">' +
+            '<thead>' +
+            '<tr style="background: #f1f5f9; color: #475569;">' +
+            '<th style="width: 75px; text-align: center; padding: 4px 6px;">Kode</th>' +
+            '<th style="padding: 4px 6px;">Nama / Keterangan</th>' +
+            '<th style="width: 105px; text-align: right; padding: 4px 6px;">Nilai</th>' +
+            '</tr>' +
+            '</thead>' +
+            '<tbody>';
+
+        $.each(sub.variabel_list, function (_, vItem) {
+            var valDisplay = '-';
+            var isVarChildMissing = !!vItem.child_unit_not_found || (vItem.agregasi_info && vItem.agregasi_info.indexOf('Tidak ada unit') !== -1);
+            if (isVarChildMissing) {
+                var vMissing = vItem.agregasi_info || ('Tidak ada unit (' + (vItem.target_unit_label || 'bawahan') + ')');
+                valDisplay = '<span class="label label-warning pad-3-6" style="font-size: 10px;" title="' + htmlspecialchars(vMissing) + '">' +
+                    '<i class="fa fa-exclamation-triangle"></i> ' + htmlspecialchars(vMissing) + '</span>';
+            } else if (vItem.nilai !== null && vItem.nilai !== undefined && vItem.nilai !== '') {
+                var nNum = parseFloat(vItem.nilai);
+                var tooltipSumber = vItem.agregasi_info ? vItem.agregasi_info : (vItem.sumber ? ('Sumber: ' + vItem.sumber) : 'Data variabel');
+                var isChildAgregasi = (vItem.sumber === 'agregasi_child') || !!vItem.agregasi_info;
+                var badgeBg = isChildAgregasi ? 'background-color: #0d9488;' : 'background-color: #2563eb;';
+                valDisplay = '<span class="badge" style="font-size: 11px; font-weight: 700; padding: 3px 6px; ' + badgeBg + '" title="' + htmlspecialchars(tooltipSumber) + '">' +
+                    nNum + (vItem.satuan ? ' ' + htmlspecialchars(vItem.satuan) : '') + '</span>';
+            } else {
+                valDisplay = '<span class="text-muted font-italic">-</span>';
+            }
+
+            var descHtml = '<span class="text-semibold text-navy">' + htmlspecialchars(vItem.nama_variabel || vItem.kode_variabel) + '</span>';
+            if (isVarChildMissing) {
+                descHtml += ' <span class="label label-warning" style="font-size: 9px;" title="' + htmlspecialchars(vItem.agregasi_info || 'Unit anak tidak ditemukan') + '"><i class="fa fa-exclamation-triangle"></i> Unit Tidak Ada</span>';
+            } else if (vItem.agregasi_info || vItem.sumber === 'agregasi_child') {
+                descHtml += ' <span class="label label-info" style="font-size: 9px;" title="' + htmlspecialchars(vItem.agregasi_info || 'Akumulasi unit bawahan') + '"><i class="fa fa-sitemap"></i> Akumulasi Unit</span>';
+            }
+
+            h += '<tr>' +
+                '<td style="text-align: center; vertical-align: middle; padding: 4px 6px;"><span class="label label-primary font-monospace" style="font-size: 10px;">' + htmlspecialchars(vItem.kode_variabel) + '</span></td>' +
+                '<td style="vertical-align: middle; padding: 4px 6px;">' + descHtml + '</td>' +
+                '<td style="text-align: right; vertical-align: middle; padding: 4px 6px;">' + valDisplay + '</td>' +
+                '</tr>';
+        });
+
+        h += '</tbody></table></div></div>';
+        return h;
+    }
+
+    /**
+     * Render Panel Evaluasi Penilaian Pemenuhan oleh Auditor
+     */
+    function renderPanelEvaluasiAuditor(sub) {
+        var childCheck = checkChildUnitNotFound(sub);
+        var isChildNotFound = childCheck.isNotFound;
+        var missingMsg = childCheck.message;
+
+        var id = sub.id_penugasan_jawaban;
+        var statusP = sub.status_pemenuhan || '';
+        var subStatus = sub.sub_status_pemenuhan || '';
+        var isAcceptable = (subStatus === 'Acceptable');
+        var isConcern = (subStatus === 'Concern');
+        var isWeakness = (subStatus === 'Weakness');
+        var isDefisiensi = (subStatus === 'Defisiensi');
+
+        var skorVal = (sub.skor_review !== null && sub.skor_review !== undefined && sub.skor_review !== '') ? parseFloat(sub.skor_review).toFixed(2) : (isAcceptable ? '4.00' : (isConcern ? '3.00' : (isWeakness ? '2.00' : (isDefisiensi ? '0.00' : ''))));
+        var catatanRev = sub.catatan_review ? htmlspecialchars(sub.catatan_review) : '';
+
+        var h = '<form id="form-audit-' + id + '" data-id="' + id + '" onsubmit="return false;">';
+        h += '<input type="hidden" name="id_penugasan_jawaban" value="' + id + '">';
+        h += '<input type="hidden" name="idpenugasan" value="' + idpenugasan + '">';
+        h += '<input type="hidden" name="status_pemenuhan" value="' + statusP + '">';
+        h += '<input type="hidden" name="sub_status_pemenuhan" value="' + subStatus + '">';
+
+        var cardStyle = !isAuditActive ? 'style="cursor: not-allowed; opacity: 0.7;"' : '';
+        h += '<div class="form-group margin-bottom-10">' +
+            '<div class="clearfix margin-bottom-5">' +
+            '<label class="fs-12 font-bold text-navy no-margin pull-left">' +
+            'Penilaian auditor' +
+            '</label>' +
+            '<span class="save-status-indicator text-muted pull-right fs-11" id="audit-status-' + id + '">' +
+            ((statusP || subStatus) ? '<i class="fa fa-check-circle text-success"></i> Tersimpan' : 'Belum dinilai') +
+            '</span>' +
+            '</div>';
+
+        // Peringatan jika data child unit tidak ada
+        if (isChildNotFound) {
+            h += '<div class="alert alert-warning" style="background-color: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #f59e0b; color: #92400e; padding: 8px 10px; margin-bottom: 10px; border-radius: 6px; font-size: 11.5px; line-height: 1.4;">' +
+                '<i class="fa fa-info-circle fa-lg margin-r-5 text-warning"></i> <b>Catatan Asesor/Auditor:</b> Butir ini mengacu pada agregasi unit bawahan, namun <b>' + htmlspecialchars(missingMsg) + '</b> pada unit kerja auditee ini.' +
+                '</div>';
+        }
+
+        h += '<div class="subopsi-section">' +
+
+            // 1. KELOMPOK MEMENUHI
+            '<div class="subopsi-group subopsi-group-memenuhi">' +
+            '<div class="subopsi-group-title text-success">' +
+            '<i class="fa fa-check-circle"></i> Memenuhi' +
+            '</div>' +
+
+            // 1.1 Acceptable
+            '<div class="subopsi-card ' + (isAcceptable ? 'selected-acceptable' : '') + '" data-val-parent="Memenuhi" data-val-sub="Acceptable" data-default-skor="4.00" ' + cardStyle + '>' +
+            '<div class="subopsi-icon text-success"><i class="fa ' + (isAcceptable ? 'fa-check-circle' : 'fa-circle-o') + '"></i></div>' +
+            '<div class="subopsi-content">' +
+            '<div class="subopsi-header">' +
+            '<span class="subopsi-title text-success">Acceptable</span>' +
+            (SHOW_SKOR ? '<span class="badge bg-green fs-10">Skor 4.00</span>' : '') +
+            '</div>' +
+            '<p class="subopsi-desc">Butir evaluasi sepenuhnya memenuhi kriteria akreditasi.</p>' +
+            '</div>' +
+            '</div>' +
+
+            // 1.2 Concern
+            '<div class="subopsi-card ' + (isConcern ? 'selected-concern' : '') + '" data-val-parent="Memenuhi" data-val-sub="Concern" data-default-skor="3.00" ' + cardStyle + '>' +
+            '<div class="subopsi-icon text-warning"><i class="fa ' + (isConcern ? 'fa-check-circle' : 'fa-circle-o') + '"></i></div>' +
+            '<div class="subopsi-content">' +
+            '<div class="subopsi-header">' +
+            '<span class="subopsi-title text-warning">Concern</span>' +
+            (SHOW_SKOR ? '<span class="badge bg-yellow fs-10">Skor 3.00</span>' : '') +
+            '</div>' +
+            '<p class="subopsi-desc">Butir evaluasi saat ini memenuhi kriteria akreditasi, namun terdapat potensi terjadinya perubahan situasi yang dapat menyebabkan perguruan tinggi tidak lagi memenuhi kriteria akreditasi. Diharapkan unit kerja melakukan perbaikan berkelanjutan agar sesuai dengan kriteria akreditasi.</p>' +
+            '</div>' +
+            '</div>' +
+
+            '</div>' + // end subopsi-group-memenuhi
+
+            // 2. KELOMPOK TIDAK MEMENUHI
+            '<div class="subopsi-group subopsi-group-tidak">' +
+            '<div class="subopsi-group-title text-danger">' +
+            '<i class="fa fa-times-circle"></i> Tidak memenuhi' +
+            '</div>' +
+
+            // 2.1 Weakness
+            '<div class="subopsi-card ' + (isWeakness ? 'selected-weakness' : '') + '" data-val-parent="Tidak Memenuhi" data-val-sub="Weakness" data-default-skor="2.00" ' + cardStyle + '>' +
+            '<div class="subopsi-icon text-danger"><i class="fa ' + (isWeakness ? 'fa-check-circle' : 'fa-circle-o') + '"></i></div>' +
+            '<div class="subopsi-content">' +
+            '<div class="subopsi-header">' +
+            '<span class="subopsi-title text-danger">Weakness</span>' +
+            (SHOW_SKOR ? '<span class="badge bg-red fs-10" style="background-color: #ea580c !important;">Skor 2.00</span>' : '') +
+            '</div>' +
+            '<p class="subopsi-desc">Butir evaluasi memenuhi sebagian kriteria akreditasi saat ini, namun tingkat kesesuaian masih rendah dan membutuhkan perbaikan. Tindakan perbaikan diperlukan untuk meningkatkan pemenuhan kriteria akreditasi.</p>' +
+            '</div>' +
+            '</div>' +
+
+            // 2.2 Defisiensi
+            '<div class="subopsi-card ' + (isDefisiensi ? 'selected-defisiensi' : '') + '" data-val-parent="Tidak Memenuhi" data-val-sub="Defisiensi" data-default-skor="0.00" ' + cardStyle + '>' +
+            '<div class="subopsi-icon text-danger"><i class="fa ' + (isDefisiensi ? 'fa-check-circle' : 'fa-circle-o') + '"></i></div>' +
+            '<div class="subopsi-content">' +
+            '<div class="subopsi-header">' +
+            '<span class="subopsi-title text-danger">Defisiensi</span>' +
+            (SHOW_SKOR ? '<span class="badge bg-red fs-10">Skor 0.00</span>' : '') +
+            '</div>' +
+            '<p class="subopsi-desc">Butir evaluasi tidak memenuhi kriteria akreditasi.</p>' +
+            '</div>' +
+            '</div>' +
+
+            '</div>' + // end subopsi-group-tidak
+
+            '</div>' + // end subopsi-section
+            '</div>';
+
+        // Skor Review Auditor: Disembunyikan (hide skor), namun tetap disimpan sebagai hidden field
+        h += '<input type="hidden" name="skor_review" class="audit-skor-input" value="' + skorVal + '">';
+
+        var defaultPlaceholder = isChildNotFound
+            ? "Tuliskan catatan hasil audit, temuan, atau catatan penyesuaian karena unit bawahan tidak ada..."
+            : "Tuliskan catatan hasil audit, temuan defisiensi, atau rekomendasi peningkatan...";
+        h += '<div class="form-group margin-bottom-10">' +
+            '<label class="fs-12 font-bold text-slate-700">Catatan atau rekomendasi:</label>' +
+            '<textarea name="catatan_review" class="form-control input-sm audit-catatan" rows="3" placeholder="' + defaultPlaceholder + '" ' + (!isAuditActive ? 'readonly disabled' : '') + '>' + catatanRev + '</textarea>' +
+            '</div>';
+
+        if (!isAuditActive) {
+            h += '<div class="text-right">' +
+                '<span class="label label-default fs-11 pad-4-8 inline-block"><i class="fa fa-lock"></i> Hanya dibaca</span>' +
+                '</div>';
+        } else {
+            h += '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+                '<span class="audit-save-status-bottom text-muted fs-11" id="audit-status-bottom-' + id + '">' +
+                ((statusP || subStatus) ? '<i class="fa fa-check-circle text-success"></i> Tersimpan' : '<span class="text-muted">Belum dinilai</span>') +
+                '</span>' +
+                '<button type="button" class="btn btn-success btn-sm font-bold btn-save-audit" data-id="' + id + '">' +
+                '<i class="fa fa-save"></i> Simpan' +
+                '</button>' +
+                '</div>';
+        }
+
+        h += '</form>';
+        return h;
+    }
+
+    /**
+     * Scroll container #side-indikator-list agar card yang aktif terlihat di area pandang
+     */
+    function scrollSidebarToCard(card, animate) {
+        if (!card || !card.length || !card.is(':visible')) return;
+        var container = $('#side-indikator-list');
+        if (!container.length) return;
+
+        var containerHeight = container.innerHeight();
+        var cardHeight = card.outerHeight();
+        var relativeTop = card.offset().top - container.offset().top;
+
+        // Cek apakah card sudah berada di area pandang container (toleransi 10px dari atas & bawah)
+        var isComfortablyVisible = (relativeTop >= 10 && (relativeTop + cardHeight) <= (containerHeight - 10));
+        if (isComfortablyVisible) return;
+
+        // Hitung scroll target agar card berada di tengah container
+        var currentScroll = container.scrollTop();
+        var targetScroll = currentScroll + relativeTop - (containerHeight / 2) + (cardHeight / 2);
+        if (targetScroll < 0) targetScroll = 0;
+        var maxScroll = container[0].scrollHeight - containerHeight;
+        if (targetScroll > maxScroll) targetScroll = maxScroll;
+
+        if (animate) {
+            container.stop().animate({ scrollTop: targetScroll }, 250);
+        } else {
+            container.scrollTop(targetScroll);
+        }
+    }
+
+    /**
+     * Sinkronisasi indikator aktif di sidebar saat scrolling halaman (ScrollSpy)
+     */
+    function syncSidebarOnScroll() {
+        if (isProgrammaticScroll) return;
+
+        var cards = $('#side-indikator-list .indikator-side-card');
+        if (!cards.length) return;
+
+        var windowScroll = $(window).scrollTop();
+        var windowHeight = $(window).height();
+        var docHeight = $(document).height();
+
+        // 1. Cek jika sudah di ujung bawah halaman (bottom of page), aktifkan indikator terakhir
+        if ((windowScroll + windowHeight) >= (docHeight - 40)) {
+            var lastCard = cards.filter(':visible').last();
+            if (lastCard.length) {
+                var lastId = lastCard.data('id');
+                if (currentActiveIndikatorId !== lastId) {
+                    currentActiveIndikatorId = lastId;
+                    cards.removeClass('active');
+                    lastCard.addClass('active');
+                    var isHoveredLast = $('#side-indikator-list:hover').length > 0;
+                    if (!isHoveredLast) {
+                        scrollSidebarToCard(lastCard, true);
+                    }
+                }
+                return;
+            }
+        }
+
+        var headerHeight = $('.main-header').outerHeight() || 0;
+        var isFixed = $('body').hasClass('fixed') || $('.main-header').css('position') === 'fixed';
+        var topOffset = (isFixed && headerHeight > 0) ? (headerHeight + 110) : 120;
+        var thresholdY = windowScroll + topOffset;
+
+        // Kumpulkan semua section indikator yang ada di halaman
+        var sections = $('.indikator-section-header[data-idindikator]');
+        var activeIndId = null;
+
+        if (sections.length) {
+            sections.each(function () {
+                var sec = $(this);
+                var indId = sec.data('idindikator');
+                var top = sec.offset().top;
+
+                // Hitung batas bawah section (berdasarkan elemen terakhir yang memiliki data-idindikator ini)
+                var relatedBoxes = $('[data-idindikator="' + indId + '"]');
+                var lastBox = relatedBoxes.last();
+                var bottom = lastBox.offset().top + lastBox.outerHeight();
+
+                if (thresholdY >= (top - 50) && thresholdY <= bottom) {
+                    activeIndId = indId;
+                    return false; // Ditemukan, hentikan pencarian
+                } else if (thresholdY < top && !activeIndId) {
+                    // Jika user masih di atas section pertama
+                    activeIndId = indId;
+                    return false;
+                } else if (thresholdY >= (top - 50)) {
+                    // Menjaga indikator terakhir yang sudah dilewati
+                    activeIndId = indId;
+                }
+            });
+        } else {
+            // Fallback ke .rubrik-item-box
+            var boxes = $('.rubrik-item-box[data-idindikator], .aspek-card[data-idindikator]');
+            boxes.each(function () {
+                var b = $(this);
+                var top = b.offset().top;
+                if (thresholdY >= (top - 50)) {
+                    activeIndId = b.data('idindikator');
+                }
+            });
+        }
+
+        // Jika user masih sangat di atas (misal masih di area header/filter), pilih indikator pertama yang tampil
+        if (!activeIndId) {
+            var firstCard = cards.filter(':visible').first();
+            if (firstCard.length) {
+                activeIndId = firstCard.data('id');
+            }
+        }
+
+        if (activeIndId && currentActiveIndikatorId !== activeIndId) {
+            currentActiveIndikatorId = activeIndId;
+            cards.removeClass('active');
+            var activeCard = $('#side-indikator-list .indikator-side-card[data-id="' + activeIndId + '"]');
+            if (activeCard.length) {
+                activeCard.addClass('active');
+                var isHovered = $('#side-indikator-list:hover').length > 0;
+                if (!isHovered) {
+                    scrollSidebarToCard(activeCard, true);
+                }
+            }
+        }
+    }
+
+    /**
+     * Render Kolom Kiri: Navigasi Indikator SPMI (Persis Penilaian Mandiri)
+     */
+    function renderKolomKiriIndikator(items) {
+        if (!items || items.length === 0) return;
+
+        var indMap = {};
+        var indList = [];
+
+        $.each(rawJawabanList, function (i, item) {
+            if (currentFilterKriteria && item.id_kriteria != currentFilterKriteria) return;
+
+            var indId = item.id_indikator;
+            if (!indMap[indId]) {
+                indMap[indId] = {
+                    id_indikator: indId,
+                    nomor_indikator: item.nomor_indikator,
+                    pernyataan_indikator: item.pernyataan_indikator,
+                    justifikasi: item.justifikasi,
+                    is_syarat_unggul: item.is_syarat_unggul_indikator,
+                    id_kriteria: item.id_kriteria,
+                    kode_kriteria: item.kode_kriteria,
+                    nama_kriteria: item.nama_kriteria,
+                    id_sasaran_mutu: item.id_sasaran_mutu,
+                    kode_sasaran: item.kode_sasaran,
+                    nama_sasaran: item.nama_sasaran,
+                    aspek_map: {},
+                    total_sub: 0,
+                    audited_sub: 0
+                };
+                indList.push(indMap[indId]);
+            }
+
+            var aId = item.id_aspek;
+            if (!indMap[indId].aspek_map[aId]) {
+                indMap[indId].aspek_map[aId] = { total_sub: 0, audited_sub: 0 };
+            }
+
+            indMap[indId].total_sub++;
+            indMap[indId].aspek_map[aId].total_sub++;
+
+            var isEvaluated = (item.status_pemenuhan === 'Memenuhi' || item.status_pemenuhan === 'Tidak Memenuhi' || (item.sub_status_pemenuhan && item.sub_status_pemenuhan !== ''));
+            if (isEvaluated) {
+                indMap[indId].audited_sub++;
+                indMap[indId].aspek_map[aId].audited_sub++;
+            }
+        });
+
+        $('#side-indikator-count').text(indList.length + ' Indikator');
+
+        // Simpan active card id jika sudah ada yang dipilih agar tidak reset saat refresh
+        var activeId = currentActiveIndikatorId || $('#side-indikator-list .indikator-side-card.active').data('id');
+
+        var html = '';
+        $.each(indList, function (i, ind) {
+            var totalAspek = 0;
+            var auditedAspek = 0;
+            $.each(ind.aspek_map, function (aId, aStat) {
+                totalAspek++;
+                if (aStat.total_sub > 0 && aStat.audited_sub >= aStat.total_sub) {
+                    auditedAspek++;
+                }
+            });
+
+            var isLengkap = (ind.total_sub > 0 && ind.audited_sub >= ind.total_sub);
+            var statusIcon = '<span class="side-indikator-status-wrap" id="side-ind-status-' + ind.id_indikator + '">' +
+                (isLengkap
+                    ? '<i class="fa fa-check-circle text-success pull-right fs-13" title="Lengkap (' + ind.audited_sub + '/' + ind.total_sub + ' Sub-Butir Dievaluasi)"></i>'
+                    : '<span class="pull-right badge fs-10 ' + (ind.audited_sub > 0 ? 'bg-yellow' : 'bg-gray') + '" title="' + ind.audited_sub + ' dari ' + ind.total_sub + ' Sub-Butir Dievaluasi">' + ind.audited_sub + '/' + ind.total_sub + '</span>') +
+                '</span>';
+
+            var isActive = (activeId ? (activeId == ind.id_indikator) : (i === 0)) ? ' active' : '';
+            if (isActive && !currentActiveIndikatorId) {
+                currentActiveIndikatorId = ind.id_indikator;
+            }
+
+            html += '<div class="indikator-side-card' + isActive + '" data-id="' + ind.id_indikator + '">';
+
+            // Header dalam Card: Kriteria Mutu & Sasaran Mutu (PPEPP)
+            html += '<div class="side-card-header">' +
+                '<div class="side-card-top">' +
+                '<div class="side-card-title" title="Kriteria: ' + htmlspecialchars(ind.nama_kriteria || ind.kode_kriteria) + '">' +
+                '<span class="label label-primary fs-9 pad-2-5 margin-r-5">' + htmlspecialchars(ind.nama_kriteria || ind.kode_kriteria) + '</span>' +
+                '</div>' +
+                statusIcon +
+                '</div>' +
+                '<div class="side-card-tags">' +
+                (ind.nama_sasaran ? '<span class="label badge-sub-purple pad-1-6 fs-9" title="Sasaran Mutu (PPEPP)"><i class="fa fa-crosshairs"></i> ' + htmlspecialchars(ind.nama_sasaran) + '</span> ' : '') +
+                '<span class="label label-info pad-1-6 fs-9">' +
+                'Indikator ' + ind.nomor_indikator +
+                '</span> ' +
+                (parseInt(ind.is_syarat_unggul) === 1 ? '<span class="label label-warning fs-9 pad-1-6" title="Syarat Perlu"><i class="fa fa-check-circle"></i> Syarat Perlu</span> ' : '') +
+                '</div>' +
+                '</div>';
+
+            // Pernyataan Indikator
+            html += '<div class="side-card-body">' +
+                htmlspecialchars(ind.pernyataan_indikator) +
+                '</div>';
+
+            // Justifikasi / Regulasi jika ada
+            if (ind.justifikasi) {
+                html += '<div class="side-card-footer">' +
+                    '<i class="fa fa-bookmark-o"></i> ' + htmlspecialchars(ind.justifikasi) +
+                    '</div>';
+            }
+
+            html += '</div>';
+        });
+
+        $('#side-indikator-list').html(html);
+
+        // Click indikator di kolom kiri -> scroll ke butir terkait
+        $('#side-indikator-list .indikator-side-card').off('click').on('click', function () {
+            var indId = $(this).data('id');
+            $('#side-indikator-list .indikator-side-card').removeClass('active');
+            $(this).addClass('active');
+            currentActiveIndikatorId = indId;
+
+            // Scroll container sidebar agar card tetap di tengah view
+            scrollSidebarToCard($(this), true);
+
+            var targetHeader = $('#indikator-section-' + indId);
+            var targetBox = targetHeader.length ? targetHeader : $('.rubrik-item-box[data-idindikator="' + indId + '"], .aspek-card[data-idindikator="' + indId + '"]').first();
+            if (targetBox.length) {
+                var headerHeight = $('.main-header').outerHeight() || 0;
+                var isFixed = $('body').hasClass('fixed') || $('.main-header').css('position') === 'fixed';
+                var scrollOffset = (isFixed && headerHeight > 0) ? (headerHeight + 15) : 20;
+
+                isProgrammaticScroll = true;
+                $('html, body').stop().animate({
+                    scrollTop: targetBox.offset().top - scrollOffset
+                }, 400, function () {
+                    setTimeout(function () {
+                        isProgrammaticScroll = false;
+                        syncSidebarOnScroll();
+                    }, 80);
+                });
+
+                targetBox.css('transform', 'scale(1.01)').delay(300).queue(function (next) {
+                    $(this).css('transform', 'none');
+                    next();
+                });
+            }
+        });
+
+        // Terapkan filter pencarian sidebar jika sedang aktif
+        filterSidebarIndikator();
+
+        // Jalankan sinkronisasi awal posisi scroll
+        setTimeout(function () {
+            syncSidebarOnScroll();
+        }, 100);
+    }
+
+    /**
+     * Filter realtime list card indikator pada kolom kiri (sidebar)
+     */
+    function filterSidebarIndikator() {
+        var q = ($('#search-sidebar-indikator').val() || '').toLowerCase().trim();
+        if (q.length > 0) {
+            $('#btn-clear-sidebar-search').show();
+        } else {
+            $('#btn-clear-sidebar-search').hide();
+        }
+
+        var cards = $('#side-indikator-list .indikator-side-card');
+        var total = cards.length;
+        var visibleCount = 0;
+
+        cards.each(function () {
+            var cardText = $(this).text().toLowerCase();
+            var isMatch = (!q || cardText.indexOf(q) >= 0);
+            $(this).toggle(isMatch);
+            if (isMatch) visibleCount++;
+        });
+
+        var emptyEl = $('#side-indikator-search-empty');
+        if (visibleCount === 0 && total > 0) {
+            if (!emptyEl.length) {
+                $('#side-indikator-list').append(
+                    '<div id="side-indikator-search-empty" class="text-center text-muted" style="padding: 20px 10px; font-size: 11.5px;">' +
+                    '<i class="fa fa-search fa-2x text-muted" style="opacity: 0.4; margin-bottom: 8px;"></i><br>' +
+                    '<span>Tidak ada indikator yang cocok dengan kata kunci <b>"' + htmlspecialchars(q) + '"</b></span>' +
+                    '</div>'
+                );
+            } else {
+                emptyEl.find('b').text('"' + q + '"');
+                emptyEl.show();
+            }
+        } else if (emptyEl.length) {
+            emptyEl.hide();
+        }
+
+        if (q) {
+            $('#side-indikator-count').text(visibleCount + ' / ' + total + ' Indikator');
+        } else {
+            $('#side-indikator-count').text(total + ' Indikator');
+        }
+    }
+
+    /**
+     * Memperbarui visual status header & border pada card aspek setelah butir dievaluasi
+     */
+    function updateAspekCardStatus(idAspek) {
+        if (!idAspek) return;
+
+        var totalSubInAspek = 0;
+        var auditedSubInAspek = 0;
+
+        $.each(rawJawabanList, function (rIdx, rItem) {
+            if (rItem.id_aspek == idAspek) {
+                totalSubInAspek++;
+                var isEvaluated = (rItem.status_pemenuhan === 'Memenuhi' || rItem.status_pemenuhan === 'Tidak Memenuhi' || (rItem.sub_status_pemenuhan && rItem.sub_status_pemenuhan !== ''));
+                if (isEvaluated) {
+                    auditedSubInAspek++;
+                }
+            }
+        });
+
+        var isAllAudited = (totalSubInAspek > 0 && auditedSubInAspek >= totalSubInAspek);
+        var card = $('#aspek-card-' + idAspek);
+        if (!card.length) return;
+
+        if (isAllAudited) {
+            card.removeClass('status-belum-diisi').addClass('status-sudah-diisi');
+        } else {
+            card.removeClass('status-sudah-diisi').addClass('status-belum-diisi');
+        }
+        var newHeaderBadgeHtml = auditAspekStatusHtml(auditedSubInAspek, totalSubInAspek);
+
+        var statusHeaderEl = $('#aspek-status-header-' + idAspek);
+        if (statusHeaderEl.length) {
+            statusHeaderEl.html(newHeaderBadgeHtml);
+        }
+        card.find('.aspek-header-status').html(newHeaderBadgeHtml);
+    }
+
+    /**
+     * Debounce Auto-Save agar tidak spam request saat user mengetik
+     */
+    function debounceSaveAudit(idjawaban) {
+        if (!isAuditActive) return;
+
+        var statusLabel = $('#audit-status-' + idjawaban);
+        var bottomStatusLabel = $('#audit-status-bottom-' + idjawaban);
+
+        statusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+        if (bottomStatusLabel.length) {
+            bottomStatusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+        }
+
+        if (saveDebounceTimers[idjawaban]) {
+            clearTimeout(saveDebounceTimers[idjawaban]);
+        }
+
+        saveDebounceTimers[idjawaban] = setTimeout(function () {
+            saveAuditItem(idjawaban, false);
+        }, 850);
+    }
+
+    /**
+     * Simpan Hasil Penilaian Audit Per Butir (Mendukung Auto-Save dan Manual Click)
+     */
+    function saveAuditItem(idjawaban, isManualClick) {
+        if (saveDebounceTimers[idjawaban]) {
+            clearTimeout(saveDebounceTimers[idjawaban]);
+            delete saveDebounceTimers[idjawaban];
+        }
+
+        if (!isAuditActive) {
+            if (isManualClick) {
+                swal('Perhatian', 'Jadwal penilaian auditor sedang tidak aktif (belum aktif atau batas waktu/deadline telah berakhir).', 'warning');
+            }
+            return;
+        }
+
+        var form = $('#form-audit-' + idjawaban);
+        if (!form.length) return;
+
+        var statusPemenuhan = form.find('[name="status_pemenuhan"]').val();
+        var subStatusVal = form.find('[name="sub_status_pemenuhan"]').val();
+        var skorVal = form.find('.audit-skor-input').val();
+        var catatanVal = form.find('.audit-catatan').val();
+
+        // Validasi saat klik tombol simpan manual
+        if (isManualClick && !statusPemenuhan && !subStatusVal) {
+            swal('Peringatan', 'Silakan pilih evaluasi pemenuhan kriteria akreditasi (Acceptable, Concern, Weakness, atau Defisiensi) terlebih dahulu.', 'warning');
+            return;
+        }
+
+        var formData = form.serialize();
+        var statusLabel = $('#audit-status-' + idjawaban);
+        var bottomStatusLabel = $('#audit-status-bottom-' + idjawaban);
+
+        statusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+        if (bottomStatusLabel.length) {
+            bottomStatusLabel.html('<i class="fa fa-spinner fa-spin text-primary"></i> Menyimpan...');
+        }
+
+        // Optimistic UI Update: update memory, sub-item badge, aspek header status, progress bar & sidebar seketika
+        var idAspekForUpdate = form.closest('.aspek-card').data('idaspek');
+        $.each(rawJawabanList, function (_, itm) {
+            if (itm.id_penugasan_jawaban == idjawaban) {
+                if (statusPemenuhan) itm.status_pemenuhan = statusPemenuhan;
+                if (subStatusVal) itm.sub_status_pemenuhan = subStatusVal;
+                if (skorVal !== undefined && skorVal !== '') itm.skor_review = skorVal;
+                itm.catatan_review = catatanVal;
+                if (!idAspekForUpdate) idAspekForUpdate = itm.id_aspek;
+                return false;
+            }
+        });
+
+        // Update badge visual di header sub-aspek langsung tanpa menunggu AJAX
+        if (subStatusVal || statusPemenuhan) {
+            var newBadge = evalBadgeHtml(idjawaban, subStatusVal, statusPemenuhan);
+            $('#badge-eval-' + idjawaban).replaceWith(newBadge);
+        }
+
+        // Update status header pada card aspek (sticky header) dan progress bar langsung
+        if (idAspekForUpdate) {
+            updateAspekCardStatus(idAspekForUpdate);
+        }
+        updateAuditProgressBar();
+        renderKolomKiriIndikator(rawJawabanList);
+
+        if (isManualClick) {
+            $('body').loading('start');
+        }
+
+        $.ajax({
+            url: appBaseUrl + '/penugasan/rubrik_save_audit',
+            type: 'POST',
+            data: formData,
+            dataType: 'json'
+        }).done(function (res) {
+            if (res && res.status) {
+                statusLabel.html('<i class="fa fa-check-circle text-success"></i> Tersimpan');
+                if (bottomStatusLabel.length) {
+                    bottomStatusLabel.html('<i class="fa fa-check-circle text-success"></i> Tersimpan');
+                }
+
+                // Konfirmasi ulang update status header aspek (sticky header) & sidebar
+                if (idAspekForUpdate) {
+                    updateAspekCardStatus(idAspekForUpdate);
+                }
+
+                if (isManualClick) {
+                    swal({
+                        title: 'Tersimpan!',
+                        text: 'Hasil penilaian audit berhasil disimpan.',
+                        icon: 'success',
+                        timer: 1300,
+                        buttons: false
+                    });
+                }
+            } else {
+                statusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Gagal');
+                if (bottomStatusLabel.length) {
+                    bottomStatusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Gagal menyimpan');
+                }
+                if (isManualClick) {
+                    swal('Gagal', (res && res.message) ? res.message : 'Tidak dapat menyimpan hasil audit.', 'error');
+                }
+            }
+        }).fail(function () {
+            statusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Error');
+            if (bottomStatusLabel.length) {
+                bottomStatusLabel.html('<i class="fa fa-exclamation-circle text-danger"></i> Kesalahan jaringan');
+            }
+            if (isManualClick) {
+                swal('Error', 'Terjadi kesalahan jaringan saat menyimpan hasil audit.', 'error');
+            }
+        }).always(function () {
+            if (isManualClick) {
+                $('body').loading('stop');
+            }
+        });
+    }
+
+    /**
+     * Buka Kembali Kunci Pengisian Auditee untuk Revisi Data
+     */
+    function unlockAuditeeForRevision() {
+        swal({
+            title: 'Buka Kunci untuk Revisi?',
+            text: 'Unit auditee akan dapat mengedit kembali isian penilaian mandiri dan mengunggah dokumen perbaikan. Proses audit akan dijeda hingga unit submit kembali.',
+            icon: 'warning',
+            buttons: {
+                cancel: {
+                    text: 'Batal',
+                    visible: true,
+                    className: 'btn btn-default'
+                },
+                confirm: {
+                    text: 'Ya, Buka Kunci Revisi!',
+                    value: true,
+                    className: 'btn btn-warning'
+                }
+            }
+        }).then(function (confirmed) {
+            if (confirmed) {
+                $('body').loading('start');
+                $.ajax({
+                    url: appBaseUrl + '/penugasan/rubrik_unlock_auditee',
+                    type: 'POST',
+                    data: { idpenugasan: idpenugasan },
+                    dataType: 'json'
+                }).done(function (res) {
+                    $('body').loading('stop');
+                    if (res && res.status) {
+                        swal({
+                            title: 'Kunci Dibuka!',
+                            text: 'Formulir penilaian mandiri unit auditee berhasil dibuka untuk revisi.',
+                            icon: 'success'
+                        }).then(function () {
+                            location.reload();
+                        });
+                    } else {
+                        swal('Gagal', (res && res.message) ? res.message : 'Gagal membuka kunci auditee.', 'error');
+                    }
+                }).fail(function () {
+                    $('body').loading('stop');
+                    swal('Error', 'Terjadi kesalahan jaringan saat membuka kunci.', 'error');
+                });
+            }
+        });
+    }
+
+    /**
+     * Selesaikan & Finalisasi Penilaian Auditor
+     */
+    function finalizeAudit() {
+        swal({
+            title: 'Selesaikan & Finalisasi Audit?',
+            text: 'Tahapan penilaian auditor akan ditandai selesai dan difinalisasi pada sistem.',
+            icon: 'info',
+            buttons: {
+                cancel: {
+                    text: 'Batal',
+                    visible: true,
+                    className: 'btn btn-default'
+                },
+                confirm: {
+                    text: 'Ya, Selesaikan Audit!',
+                    value: true,
+                    className: 'btn btn-success'
+                }
+            }
+        }).then(function (confirmed) {
+            if (confirmed) {
+                $('body').loading('start');
+                $.ajax({
+                    url: appBaseUrl + '/penugasan/rubrik_finalize_audit',
+                    type: 'POST',
+                    data: { idpenugasan: idpenugasan },
+                    dataType: 'json'
+                }).done(function (res) {
+                    $('body').loading('stop');
+                    if (res && res.status) {
+                        swal({
+                            title: 'Audit Selesai!',
+                            text: 'Tahapan penilaian audit berhasil diselesaikan dan difinalisasi.',
+                            icon: 'success'
+                        }).then(function () {
+                            location.reload();
+                        });
+                    } else {
+                        swal('Gagal', (res && res.message) ? res.message : 'Gagal menyelesaikan audit.', 'error');
+                    }
+                }).fail(function () {
+                    $('body').loading('stop');
+                    swal('Error', 'Terjadi kesalahan jaringan saat menyelesaikan audit.', 'error');
+                });
+            }
+        });
+    }
+
+    /**
+     * Hitung & Perbarui Progress Bar Evaluasi Auditor
+     */
+    function updateAuditProgressBar() {
+        var total = rawJawabanList.length;
+        var audited = 0;
+        var memenuhi = 0;
+        var tidak = 0;
+
+        $.each(rawJawabanList, function (_, itm) {
+            var isMem = (itm.status_pemenuhan === 'Memenuhi' || itm.sub_status_pemenuhan === 'Acceptable' || itm.sub_status_pemenuhan === 'Concern');
+            var isTdk = (itm.status_pemenuhan === 'Tidak Memenuhi' || itm.sub_status_pemenuhan === 'Weakness' || itm.sub_status_pemenuhan === 'Defisiensi');
+            if (isMem) {
+                audited++;
+                memenuhi++;
+            } else if (isTdk) {
+                audited++;
+                tidak++;
+            }
+        });
+
+        $('#chip-total-butir').text(total);
+        $('#chip-sudah-audit').text(audited + ' / ' + total);
+        $('#chip-memenuhi').text(memenuhi);
+        $('#chip-tidak-memenuhi').text(tidak);
+
+        var pct = total > 0 ? Math.round((audited / total) * 100) : 0;
+        $('#audit-progress-bar').css('width', pct + '%');
+        $('#audit-progress-text').text(pct + '%');
+        $('#audit-progress-desc').text(audited + ' dari ' + total + ' butir rubrik telah dievaluasi auditor.');
+    }
+
+})(jQuery);

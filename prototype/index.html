@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SIQA-INFOKOM</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/"><b>SIQA</b>-INFOKOM</a>
+  <span class="brand-sub">Audit Mutu Internal berbasis Instrumen LAM INFOKOM</span>
+  <span class="spacer"></span>
+  <span class="proto-tag">PROTOTYPE</span>
+  <span class="user">RANDY CAHYA WIHANDIKA</span>
+</header>
+<div class="layout">
+  <nav class="sidenav">
+    <div class="sidenav-h">MENU</div>
+    <a href="#/" data-nav="home">Beranda</a>
+    <a href="#/panduan" data-nav="panduan">Panduan PPEPP &amp; Skala</a>
+    <div class="sidenav-h">DATA PROTOTYPE</div>
+    <button type="button" data-act="export-json">Ekspor data (JSON)</button>
+    <label class="filebtn">Impor data (JSON)<input type="file" accept="application/json" data-act="import-json"></label>
+    <button type="button" data-act="reset-demo">Reset ke data contoh</button>
+  </nav>
+  <main id="app" tabindex="-1"></main>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="data/matriks.js"></script>
+<script src="data/seed.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
